@@ -2,7 +2,7 @@
 
 Safely preview and synchronize global agent-instruction files across Windows and Linux machines over SSH.
 
-It started as a way to keep Codex `AGENTS.md` and Claude `CLAUDE.md` aligned across a small fleet without passing files through chat, email, or a cloud-drive folder. The file mappings are generic, so it can synchronize other small text configuration files too.
+It started as a way to keep Codex `AGENTS.md` and Claude `CLAUDE.md` aligned across a small fleet without passing files through chat, email, or a cloud-drive folder. The same exact-file engine supports Pi, oh-my-pi, OpenCode, and other harnesses without merging or translating their distinct instructions.
 
 ## Why this is safer than a copy loop
 
@@ -93,6 +93,37 @@ The default config is `~/.config/agent-guidance-sync/config.json`. Override it w
 
 Do not commit the private config, guidance files, SSH configuration, keys, or authentication/session data. None are needed by this repository.
 
+### Multi-harness configuration
+
+[`config.multi-harness.example.json`](config.multi-harness.example.json) contains verified native mappings for five harnesses:
+
+| Harness | Global instruction file | Important behavior |
+|---|---|---|
+| Codex | `~/.codex/AGENTS.md` | Codex-native global guidance. |
+| Claude Code | `~/.claude/CLAUDE.md` | Claude-native global guidance. |
+| Pi | `~/.pi/agent/AGENTS.md` | Pi's global context file. |
+| oh-my-pi | `~/.omp/agent/AGENTS.md` | Native OMP context; it has the highest OMP discovery priority. |
+| OpenCode | `~/.config/opencode/AGENTS.md` | Native OpenCode rules; these take precedence over its Claude compatibility fallback. |
+
+The Pi path and context behavior are documented in [Using Pi](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/usage.md#context-files). OMP documents its native path, provider precedence, and shadowing behavior in [Context files](https://github.com/can1357/oh-my-pi/blob/main/docs/context-files.md). OpenCode documents its global path and Claude fallback in [Rules](https://opencode.ai/docs/rules/).
+
+Copy the broader preset instead of the two-file starter when you use those harnesses:
+
+```powershell
+Copy-Item ./config.multi-harness.example.json (Join-Path $configDirectory 'config.json')
+```
+
+Each source file remains distinct and is copied byte-for-byte to the same native path on every target. Remove mappings for harnesses you do not use; a configured source file that does not exist fails closed before networking begins.
+
+The preset intentionally excludes:
+
+- API keys, tokens, SSH keys, and authentication files.
+- Settings, provider configuration, model catalogs, and session history.
+- Pi's `SYSTEM.md` and `APPEND_SYSTEM.md`, which alter the system prompt rather than serving as ordinary global guidance.
+- OMP's `RULES.md`, which is short, sticky, and precedence-sensitive. Add it as a separate explicit mapping only when you deliberately want identical sticky rules on every target.
+
+OMP can read several other harness conventions, but creating its native `~/.omp/agent/AGENTS.md` changes which user-level file wins. Keep that mapping only when you maintain genuinely OMP-specific guidance.
+
 ## Use
 
 Preview the entire configured fleet:
@@ -114,7 +145,7 @@ Sync-AgentGuidance -ComputerName host-one
 Sync-AgentGuidance -ComputerName host-one,host-two -Apply
 ```
 
-Existing Codex and Claude sessions may retain startup instructions. Start a new session after syncing when you need the new guidance loaded immediately.
+Existing harness sessions may retain their startup instructions. Start a new session after syncing when you need the new guidance loaded immediately.
 
 ## Test
 

@@ -1,0 +1,34 @@
+{
+  "sourceLabel": "primary-workstation",
+  "targets": [
+    "host-one",
+    "host-two"
+  ],
+  "files": [
+    {
+      "name": "Codex AGENTS.md",
+      "sourcePath": "~/.codex/AGENTS.md",
+      "destinationPath": ".codex/AGENTS.md"
+    },
+    {
+      "name": "Claude CLAUDE.md",
+      "sourcePath": "~/.claude/CLAUDE.md",
+      "destinationPath": ".claude/CLAUDE.md"
+    },
+    {
+      "name": "Pi AGENTS.md",
+      "sourcePath": "~/.pi/agent/AGENTS.md",
+      "destinationPath": ".pi/agent/AGENTS.md"
+    },
+    {
+      "name": "oh-my-pi AGENTS.md",
+      "sourcePath": "~/.omp/agent/AGENTS.md",
+      "destinationPath": ".omp/agent/AGENTS.md"
+    },
+    {
+      "name": "OpenCode AGENTS.md",
+      "sourcePath": "~/.config/opencode/AGENTS.md",
+      "destinationPath": ".config/opencode/AGENTS.md"
+    }
+  ]
+}

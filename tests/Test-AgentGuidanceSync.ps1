@@ -194,6 +194,7 @@ try {
 
     Test-Case 'manifest and public command surface are valid' {
         Assert-Equal -Expected 'AgentGuidanceSync' -Actual $manifest.Name -Because 'manifest name should match the module folder'
+        Assert-Equal -Expected '0.2.0' -Actual $manifest.Version.ToString() -Because 'the multi-harness preset should ship as version 0.2.0'
         $exportedCommands = @((Get-Command -Module AgentGuidanceSync).Name | Sort-Object -Unique)
         Assert-Equal -Expected 1 -Actual $exportedCommands.Count -Because 'only one command should be public'
         Assert-Equal -Expected 'Sync-AgentGuidance' -Actual $exportedCommands[0] -Because 'the sync command should be exported'
@@ -240,6 +241,44 @@ try {
         Assert-Equal -Expected ([IO.Path]::GetFullPath($sourcePath)) -Actual $config.Files[0].LocalPath
         Assert-Equal -Expected '.codex/AGENTS.md' -Actual $config.Files[0].RemoteRelativePath
         Assert-Equal -Expected 'AGENTS.md' -Actual $config.Files[0].Name
+    }
+
+    Test-Case 'shipped starter and multi-harness configs remain valid and narrowly scoped' {
+        $starterPath = Join-Path $repositoryRoot 'config.example.json'
+        $starter = & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $starterPath
+        Assert-Equal -Expected 2 -Actual $starter.Files.Count -Because 'the starter should stay focused on Codex and Claude'
+
+        $multiHarnessPath = Join-Path $repositoryRoot 'config.multi-harness.example.json'
+        $multiHarness = & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $multiHarnessPath
+        Assert-Equal -Expected 5 -Actual $multiHarness.Files.Count -Because 'the broader preset should cover five verified harnesses'
+
+        $expectedDestinations = @(
+            '.codex/AGENTS.md',
+            '.claude/CLAUDE.md',
+            '.pi/agent/AGENTS.md',
+            '.omp/agent/AGENTS.md',
+            '.config/opencode/AGENTS.md'
+        )
+        $actualDestinations = @($multiHarness.Files | ForEach-Object { $_.RemoteRelativePath })
+        Assert-Equal `
+            -Expected ($expectedDestinations -join '|') `
+            -Actual ($actualDestinations -join '|') `
+            -Because 'every harness should map to its documented native path'
+
+        $forbiddenState = '(?i)(auth\.(json|ya?ml)|settings\.(json|ya?ml)|config\.ya?ml|models?\.(json|ya?ml)|sessions?|RULES\.md|id_(rsa|ed25519))'
+        for ($index = 0; $index -lt $multiHarness.Files.Count; $index++) {
+            $file = $multiHarness.Files[$index]
+            $sourcePath = $file.LocalPath.Replace('\', '/')
+            $expectedSourceSuffix = '/' + $expectedDestinations[$index]
+            Assert-True `
+                -Condition $sourcePath.EndsWith($expectedSourceSuffix, [StringComparison]::OrdinalIgnoreCase) `
+                -Because "each harness should keep a distinct native source file: $sourcePath"
+
+            $mappingText = $file.LocalPath.Replace('\', '/') + '|' + $file.RemoteRelativePath
+            Assert-True `
+                -Condition ($mappingText -notmatch $forbiddenState) `
+                -Because "the shipped preset must not include credentials, settings, models, sessions, keys, or sticky rules: $mappingText"
+        }
     }
 
     Test-Case 'unsafe remote destinations are rejected' {
