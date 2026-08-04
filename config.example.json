@@ -1,0 +1,19 @@
+{
+  "sourceLabel": "primary-workstation",
+  "targets": [
+    "host-one",
+    "host-two"
+  ],
+  "files": [
+    {
+      "name": "AGENTS.md",
+      "sourcePath": "~/.codex/AGENTS.md",
+      "destinationPath": ".codex/AGENTS.md"
+    },
+    {
+      "name": "CLAUDE.md",
+      "sourcePath": "~/.claude/CLAUDE.md",
+      "destinationPath": ".claude/CLAUDE.md"
+    }
+  ]
+}

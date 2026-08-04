@@ -1,0 +1,14 @@
+# Machine inventory and private local overrides
+config.json
+*.local.json
+
+# Transaction remnants and local scratch data
+*.bak.*
+*.tmp
+.scratch/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
