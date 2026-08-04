@@ -1,6 +1,6 @@
 @{
     RootModule = 'AgentGuidanceSync.psm1'
-    ModuleVersion = '0.1.0'
+    ModuleVersion = '0.2.0'
     GUID = 'e20e5784-ce55-49dc-be7d-a8f0ef648664'
     Author = 'Austin Arlt'
     Copyright = '(c) 2026 Austin Arlt. Licensed under the MIT License.'
@@ -14,7 +14,7 @@
 
     PrivateData = @{
         PSData = @{
-            Tags = @('Codex', 'Claude', 'SSH', 'Configuration', 'PowerShell')
+            Tags = @('Codex', 'Claude', 'Pi', 'OhMyPi', 'OpenCode', 'SSH', 'Configuration', 'PowerShell')
             LicenseUri = 'https://opensource.org/license/mit'
         }
     }
