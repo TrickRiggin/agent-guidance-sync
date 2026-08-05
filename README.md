@@ -1,8 +1,8 @@
 # agent-guidance-sync
 
-Safely preview and synchronize global agent-instruction files across Windows and Linux machines over SSH.
+Safely preview and synchronize global agent instructions and a narrow set of portable Codex settings across Windows and Linux machines over SSH.
 
-It started as a way to keep Codex `AGENTS.md` and Claude `CLAUDE.md` aligned across a small fleet without passing files through chat, email, or a cloud-drive folder. The same exact-file engine supports Pi, oh-my-pi, OpenCode, and other harnesses without merging or translating their distinct instructions.
+It started as a way to keep Codex `AGENTS.md` and Claude `CLAUDE.md` aligned across a small fleet without passing files through chat, email, or a cloud-drive folder. The same exact-file engine supports Pi, oh-my-pi, OpenCode, and other harnesses without merging or translating their distinct instructions. An optional semantic projection keeps selected Codex behavior consistent without copying machine-local trust, tools, plugins, or credentials.
 
 ## Why this is safer than a copy loop
 
@@ -14,6 +14,7 @@ It started as a way to keep Codex `AGENTS.md` and Claude `CLAUDE.md` aligned acr
 - Replacement is atomic on Unix and Windows.
 - Final content is read back and independently hash-verified.
 - Unix and Windows targets are detected automatically.
+- Codex settings are edited with Codex's own version-fenced config API; unowned TOML survives on each target.
 
 This is not a distributed transaction across the whole fleet. A host can still fail after an earlier host commits. The operation is deliberately rerunnable, and every changed destination retains a backup.
 
@@ -21,6 +22,7 @@ This is not a distributed transaction across the whole fleet. A host can still f
 
 - PowerShell 7.2 or newer on the source machine.
 - `ssh`, `scp`, and `git` available on `PATH`.
+- Codex CLI 0.146 or newer on the source machine when `codexConfig` is enabled. Targets do not need Codex for projection.
 - SSH access to every target. Passwordless keys are strongly recommended because the command uses SSH batch mode and will not stop for password prompts.
 - Unix targets need `sha256sum`, `diff`, `cp`, `mv`, `mkdir`, `chmod`, and `rm`.
 - Windows targets need OpenSSH Server and Windows PowerShell available as `powershell.exe`.
@@ -93,6 +95,38 @@ The default config is `~/.config/agent-guidance-sync/config.json`. Override it w
 
 Do not commit the private config, guidance files, SSH configuration, keys, or authentication/session data. None are needed by this repository.
 
+### Portable Codex settings
+
+Use [`config.codex-portable.example.json`](config.codex-portable.example.json) when one workstation should define fleet-wide Codex behavior. The projection is key-based, not a `config.toml` copy:
+
+```json
+{
+  "codexConfig": {
+    "sourcePath": "~/.codex/config.toml",
+    "destinationPath": ".codex/config.toml",
+    "keyPaths": [
+      "model_reasoning_effort",
+      "service_tier",
+      "desktop.followUpQueueMode",
+      "tui.status_line"
+    ],
+    "windowsKeyPaths": ["windows.sandbox"],
+    "removeKeyPaths": ["features.js_repl"]
+  }
+}
+```
+
+For every target, the module downloads that target's current config, verifies its hash, asks the local Codex app-server to edit a temporary copy, and stages the resulting target-specific candidate. The normal preview hash remains the commit fence. Existing targets retain file permissions; a newly created Unix `config.toml` is mode `0600`.
+
+The allowed settings are deliberately compiled into the module. Projection cannot address:
+
+- `projects` trust entries or paths.
+- MCP servers, apps/connectors, plugins, marketplaces, or skill rules.
+- Provider endpoints, headers, hooks, shell policy, or notification commands.
+- Auth, sessions, local databases, generated notices, or NUX state.
+
+This keeps "same behavior" separate from "same machine." Raw file mappings are also barred from targeting settings, auth, model, session, state, database, or private-key files. If a new portable setting is genuinely useful, add it to the reviewed allowlist and cover it with a test.
+
 ### Multi-harness configuration
 
 [`config.multi-harness.example.json`](config.multi-harness.example.json) contains verified native mappings for five harnesses:
@@ -155,7 +189,7 @@ The test suite has no external PowerShell-module dependencies:
 pwsh -NoProfile -File ./tests/Test-AgentGuidanceSync.ps1
 ```
 
-It validates config boundaries, escaping, module exports, generated commit logic, stale-hash rejection, corrupt-stage rejection, backups, atomic replacement, and readback receipts without touching a remote host.
+It validates config boundaries, semantic TOML preservation, target isolation, safe preview output, escaping, module exports, generated commit logic, stale-hash rejection, corrupt-stage rejection, backups, atomic replacement, and readback receipts without touching a remote host.
 
 ## License
 
