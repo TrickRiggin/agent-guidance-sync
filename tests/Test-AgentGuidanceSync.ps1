@@ -194,7 +194,7 @@ try {
 
     Test-Case 'manifest and public command surface are valid' {
         Assert-Equal -Expected 'AgentGuidanceSync' -Actual $manifest.Name -Because 'manifest name should match the module folder'
-        Assert-Equal -Expected '0.2.0' -Actual $manifest.Version.ToString() -Because 'the multi-harness preset should ship as version 0.2.0'
+        Assert-Equal -Expected '0.3.0' -Actual $manifest.Version.ToString() -Because 'semantic Codex config projection should ship as version 0.3.0'
         $exportedCommands = @((Get-Command -Module AgentGuidanceSync).Name | Sort-Object -Unique)
         Assert-Equal -Expected 1 -Actual $exportedCommands.Count -Because 'only one command should be public'
         Assert-Equal -Expected 'Sync-AgentGuidance' -Actual $exportedCommands[0] -Because 'the sync command should be exported'
@@ -279,6 +279,163 @@ try {
                 -Condition ($mappingText -notmatch $forbiddenState) `
                 -Because "the shipped preset must not include credentials, settings, models, sessions, keys, or sticky rules: $mappingText"
         }
+
+        $portablePath = Join-Path $repositoryRoot 'config.codex-portable.example.json'
+        $portable = & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $portablePath
+        Assert-True -Condition ($null -ne $portable.CodexConfig) -Because 'the portable preset should enable semantic Codex config projection'
+        Assert-Equal -Expected '.codex/config.toml' -Actual $portable.CodexConfig.RemoteRelativePath
+        Assert-Equal -Expected 24 -Actual $portable.CodexConfig.PortableKeys.Count -Because 'the example should own only reviewed portable settings'
+        Assert-Equal -Expected 1 -Actual $portable.CodexConfig.WindowsKeys.Count -Because 'Windows sandbox implementation should be platform-scoped'
+        Assert-Equal -Expected 5 -Actual $portable.CodexConfig.RemoveKeys.Count -Because 'the example should remove only reviewed stale keys'
+    }
+
+    Test-Case 'exact-copy mappings cannot bypass sensitive-state boundaries' {
+        $caseRoot = Join-Path $temporaryRoot 'reserved-destinations'
+        $sourcePath = Join-Path $caseRoot 'source.txt'
+        Set-TestText -Path $sourcePath -Content 'do not copy this as state'
+        foreach ($destination in @('.codex/config.toml', '.codex/auth.json', '.codex/sessions/thread.jsonl', '.codex/state.sqlite')) {
+            $configPath = Join-Path $caseRoot (($destination -replace '[^A-Za-z0-9]', '-') + '.json')
+            $configJson = [ordered]@{
+                targets = @('host-one')
+                files = @([ordered]@{ sourcePath = $sourcePath; destinationPath = $destination })
+            } | ConvertTo-Json -Depth 5
+            Set-TestText -Path $configPath -Content $configJson
+            Assert-Throws -Pattern 'Exact-copy mappings cannot target' -Script {
+                & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $configPath
+            }
+        }
+    }
+
+    Test-Case 'Codex projection rejects secret-bearing and capability key paths' {
+        $caseRoot = Join-Path $temporaryRoot 'unsafe-codex-key'
+        $sourceConfig = Join-Path $caseRoot 'config.toml'
+        Set-TestText -Path $sourceConfig -Content 'model = "gpt-5"'
+        $configPath = Join-Path $caseRoot 'config.json'
+        $configJson = [ordered]@{
+            targets = @('host-one')
+            codexConfig = [ordered]@{
+                sourcePath = $sourceConfig
+                keyPaths = @('mcp_servers.private.command')
+            }
+        } | ConvertTo-Json -Depth 5
+        Set-TestText -Path $configPath -Content $configJson
+        Assert-Throws -Pattern 'safe portable projection allowlist' -Script {
+            & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $configPath
+        }
+    }
+
+    Test-Case 'semantic Codex projection preserves target-local state and previews only owned keys' {
+        if (-not (Get-Command codex -CommandType Application -ErrorAction SilentlyContinue)) {
+            Write-Host '      Codex CLI unavailable; semantic materialization probe skipped.' -ForegroundColor DarkYellow
+            return
+        }
+
+        $probe = & $module {
+            $utf8 = [Text.UTF8Encoding]::new($false)
+            $sourceText = @'
+model_reasoning_effort = "high"
+service_tier = "fast"
+
+[desktop]
+followUpQueueMode = "steer"
+sansFontSize = 14
+'@
+            $targetOneText = @'
+model_reasoning_effort = "max"
+service_tier = "default"
+
+[features]
+js_repl = false
+
+[projects.'C:/private-one']
+trust_level = "trusted"
+
+[mcp_servers.private]
+command = "SECRET-CANARY-ONE"
+'@
+            $targetTwoText = @'
+model_reasoning_effort = "low"
+service_tier = "default"
+
+[projects.'D:/private-two']
+trust_level = "trusted"
+
+[mcp_servers.private]
+command = "SECRET-CANARY-TWO"
+'@
+            $sourceHome = New-AgentGuidanceTemporaryCodexHome -ConfigBytes $utf8.GetBytes($sourceText)
+            $candidateOne = $null
+            $candidateTwo = $null
+            $candidateMissing = $null
+            try {
+                $source = Get-AgentGuidanceCodexSnapshot -CodexHome $sourceHome
+                $definition = [pscustomobject]@{
+                    PortableKeys = @('model_reasoning_effort', 'service_tier', 'desktop.followUpQueueMode', 'desktop.sansFontSize')
+                    WindowsKeys = @()
+                    RemoveKeys = @('features.js_repl')
+                }
+                $candidateOne = New-AgentGuidanceCodexCandidate `
+                    -TargetConfigBytes $utf8.GetBytes($targetOneText) `
+                    -SourceSnapshot $source `
+                    -CodexConfig $definition `
+                    -Platform Windows
+                $candidateTwo = New-AgentGuidanceCodexCandidate `
+                    -TargetConfigBytes $utf8.GetBytes($targetTwoText) `
+                    -SourceSnapshot $source `
+                    -CodexConfig $definition `
+                    -Platform Unix
+                $candidateMissing = New-AgentGuidanceCodexCandidate `
+                    -TargetConfigBytes ([byte[]]::new(0)) `
+                    -SourceSnapshot $source `
+                    -CodexConfig $definition `
+                    -Platform Unix
+                $oneText = [IO.File]::ReadAllText($candidateOne.LocalPath)
+                $twoText = [IO.File]::ReadAllText($candidateTwo.LocalPath)
+                $missingText = [IO.File]::ReadAllText($candidateMissing.LocalPath)
+                $previewInventory = @([pscustomobject]@{
+                    ComputerName = 'test-host'
+                    Platform = 'Windows'
+                    Files = @([pscustomobject]@{
+                        Name = 'Codex config.toml settings'
+                        Kind = 'CodexConfig'
+                        Status = 'Different'
+                        Changes = $candidateOne.Changes
+                        LocalPath = $candidateOne.LocalPath
+                    })
+                })
+                $preview = @(& {
+                    Show-AgentGuidancePreview -Inventory $previewInventory -SourceLabel 'test-source'
+                } 6>&1 | ForEach-Object { $_.ToString() }) -join "`n"
+
+                [pscustomobject]@{
+                    OnePreserved = $oneText.Contains('SECRET-CANARY-ONE') -and $oneText.Contains('C:/private-one')
+                    TwoPreserved = $twoText.Contains('SECRET-CANARY-TWO') -and $twoText.Contains('D:/private-two')
+                    CanariesIsolated = -not $oneText.Contains('SECRET-CANARY-TWO') -and -not $twoText.Contains('SECRET-CANARY-ONE')
+                    RemovedDeadKey = -not $oneText.Contains('js_repl')
+                    NumberPreserved = $oneText -match '(?m)^sansFontSize\s*=\s*14\s*$' -and -not $oneText.Contains('serde_json')
+                    MissingConfigCreated = $missingText.Contains('model_reasoning_effort = "high"') -and $missingText.Contains('followUpQueueMode = "steer"')
+                    PreviewShowsOwnedKey = $preview.Contains('model_reasoning_effort')
+                    PreviewHidesCanary = -not $preview.Contains('SECRET-CANARY')
+                }
+            }
+            finally {
+                foreach ($candidate in @($candidateOne, $candidateTwo, $candidateMissing)) {
+                    if ($null -ne $candidate -and (Test-Path -LiteralPath $candidate.TemporaryDirectory)) {
+                        Remove-AgentGuidanceTemporaryCodexHome -Path $candidate.TemporaryDirectory
+                    }
+                }
+                Remove-AgentGuidanceTemporaryCodexHome -Path $sourceHome
+            }
+        }
+
+        Assert-True -Condition $probe.OnePreserved -Because 'target one project and MCP state should survive byte-for-byte'
+        Assert-True -Condition $probe.TwoPreserved -Because 'target two project and MCP state should survive byte-for-byte'
+        Assert-True -Condition $probe.CanariesIsolated -Because 'target-local state must never cross between candidates'
+        Assert-True -Condition $probe.RemovedDeadKey -Because 'reviewed removed keys should be deleted semantically'
+        Assert-True -Condition $probe.NumberPreserved -Because 'TOML numbers should round-trip as numbers rather than protocol wrapper objects'
+        Assert-True -Condition $probe.MissingConfigCreated -Because 'a missing target config should become a valid projected config'
+        Assert-True -Condition $probe.PreviewShowsOwnedKey -Because 'preview should identify projected settings'
+        Assert-True -Condition $probe.PreviewHidesCanary -Because 'preview must not render unowned config content'
     }
 
     Test-Case 'unsafe remote destinations are rejected' {

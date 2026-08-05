@@ -1,5 +1,40 @@
 Set-StrictMode -Version Latest
 
+$script:AgentGuidanceCodexPortableKeys = @(
+    'model',
+    'model_reasoning_effort',
+    'personality',
+    'service_tier',
+    'suppress_unstable_features_warning',
+    'approval_policy',
+    'approvals_reviewer',
+    'sandbox_mode',
+    'memories.generate_memories',
+    'memories.use_memories',
+    'features.goals',
+    'features.memories',
+    'features.mentions_v2',
+    'features.artifact',
+    'features.multi_agent',
+    'features.default_mode_request_user_input',
+    'desktop.conversationDetailMode',
+    'desktop.sansFontSize',
+    'desktop.codeFontSize',
+    'desktop.ambient-suggestions-enabled',
+    'desktop.followUpQueueMode',
+    'desktop.keepRemoteControlAwakeWhilePluggedIn',
+    'tui.status_line',
+    'tui.status_line_use_colors'
+)
+$script:AgentGuidanceCodexWindowsKeys = @('windows.sandbox')
+$script:AgentGuidanceCodexRemovalKeys = @(
+    'features.generate_memories',
+    'features.use_memories',
+    'features.js_repl',
+    'features.terminal_resize_reflow',
+    'tui.tui.transcript_syntax_highlight'
+)
+
 function Invoke-AgentGuidanceNative {
     [CmdletBinding()]
     param(
@@ -196,6 +231,83 @@ function ConvertTo-AgentGuidanceRemoteRelativePath {
     $segments -join '/'
 }
 
+function Assert-AgentGuidanceExactCopyDestination {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $RemoteRelativePath
+    )
+
+    $normalized = $RemoteRelativePath.Replace('\', '/').ToLowerInvariant()
+    $sensitiveLeaf = '(^|/)(auth|credentials?|secrets?|tokens?|settings|config|models?)\.(json|toml|ya?ml)$'
+    $statePath = '(^|/)(sessions?|state)(/|\.|$)|\.sqlite3?$|(^|/)id_(rsa|ed25519)$'
+    if ($normalized -match $sensitiveLeaf -or $normalized -match $statePath) {
+        if ($normalized -eq '.codex/config.toml') {
+            throw 'Exact-copy mappings cannot target .codex/config.toml. Use the semantic codexConfig projection instead.'
+        }
+        throw "Exact-copy mappings cannot target authentication, settings, model, session, state, database, or private-key files: $RemoteRelativePath"
+    }
+}
+
+function Assert-AgentGuidanceCodexKeyPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $KeyPath,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Portable', 'Windows', 'Remove')]
+        [string] $Kind
+    )
+
+    if ([string]::IsNullOrWhiteSpace($KeyPath) -or $KeyPath -match '[\x00\r\n|]' -or $KeyPath -match '(^\.|\.$|\.\.)') {
+        throw "Invalid Codex config key path: $KeyPath"
+    }
+
+    $allowed = switch ($Kind) {
+        'Portable' { $script:AgentGuidanceCodexPortableKeys }
+        'Windows' { $script:AgentGuidanceCodexWindowsKeys }
+        'Remove' { $script:AgentGuidanceCodexRemovalKeys }
+    }
+    if ($KeyPath -cnotin $allowed) {
+        throw "Codex config key '$KeyPath' is not in the safe $($Kind.ToLowerInvariant()) projection allowlist."
+    }
+
+    $KeyPath
+}
+
+function ConvertTo-AgentGuidanceCodexKeyList {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $Value,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Portable', 'Windows', 'Remove')]
+        [string] $Kind,
+
+        [switch] $Required
+    )
+
+    $keys = @(
+        foreach ($rawKey in @($Value)) {
+            Assert-AgentGuidanceCodexKeyPath -KeyPath ([string] $rawKey) -Kind $Kind
+        }
+    )
+    if ($Required -and $keys.Count -eq 0) {
+        throw 'codexConfig.keyPaths must contain at least one safe portable setting.'
+    }
+
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($key in $keys) {
+        if (-not $seen.Add($key)) {
+            throw "Duplicate Codex config key in $($Kind.ToLowerInvariant()) projection: $key"
+        }
+    }
+
+    $keys
+}
+
 function Assert-AgentGuidanceComputerName {
     [CmdletBinding()]
     param(
@@ -289,16 +401,12 @@ function Import-AgentGuidanceConfig {
         }
     }
 
-    $fileProperty = $config.PSObject.Properties['files']
-    if ($null -eq $fileProperty -or @($fileProperty.Value).Count -eq 0) {
-        throw 'Agent guidance config must contain at least one file mapping.'
-    }
-
     $configDirectory = [IO.Path]::GetDirectoryName($resolvedConfigPath)
     $nameSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $destinationSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $files = @()
-    foreach ($rawFile in @($fileProperty.Value)) {
+    $fileProperty = $config.PSObject.Properties['files']
+    foreach ($rawFile in @($(if ($null -ne $fileProperty) { $fileProperty.Value }))) {
         $sourcePathProperty = $rawFile.PSObject.Properties['sourcePath']
         $destinationPathProperty = $rawFile.PSObject.Properties['destinationPath']
         if ($null -eq $sourcePathProperty -or [string]::IsNullOrWhiteSpace([string] $sourcePathProperty.Value)) {
@@ -310,6 +418,7 @@ function Import-AgentGuidanceConfig {
 
         $localPath = Resolve-AgentGuidanceSourcePath -Path ([string] $sourcePathProperty.Value) -BaseDirectory $configDirectory
         $remoteRelativePath = ConvertTo-AgentGuidanceRemoteRelativePath -Path ([string] $destinationPathProperty.Value)
+        Assert-AgentGuidanceExactCopyDestination -RemoteRelativePath $remoteRelativePath
         $nameProperty = $rawFile.PSObject.Properties['name']
         $name = if ($null -ne $nameProperty -and -not [string]::IsNullOrWhiteSpace([string] $nameProperty.Value)) {
             [string] $nameProperty.Value
@@ -334,11 +443,65 @@ function Import-AgentGuidanceConfig {
         }
     }
 
+    $codexConfig = $null
+    $codexConfigProperty = $config.PSObject.Properties['codexConfig']
+    if ($null -ne $codexConfigProperty -and $null -ne $codexConfigProperty.Value) {
+        $rawCodexConfig = $codexConfigProperty.Value
+        $sourcePathProperty = $rawCodexConfig.PSObject.Properties['sourcePath']
+        $destinationPathProperty = $rawCodexConfig.PSObject.Properties['destinationPath']
+        $keyPathsProperty = $rawCodexConfig.PSObject.Properties['keyPaths']
+        $windowsKeyPathsProperty = $rawCodexConfig.PSObject.Properties['windowsKeyPaths']
+        $removeKeyPathsProperty = $rawCodexConfig.PSObject.Properties['removeKeyPaths']
+
+        $codexSourcePath = if ($null -ne $sourcePathProperty -and -not [string]::IsNullOrWhiteSpace([string] $sourcePathProperty.Value)) {
+            Resolve-AgentGuidanceSourcePath -Path ([string] $sourcePathProperty.Value) -BaseDirectory $configDirectory
+        }
+        else {
+            Resolve-AgentGuidanceSourcePath -Path '~/.codex/config.toml' -BaseDirectory $configDirectory
+        }
+        $codexDestination = if ($null -ne $destinationPathProperty -and -not [string]::IsNullOrWhiteSpace([string] $destinationPathProperty.Value)) {
+            ConvertTo-AgentGuidanceRemoteRelativePath -Path ([string] $destinationPathProperty.Value)
+        }
+        else {
+            '.codex/config.toml'
+        }
+        if ($codexDestination -cne '.codex/config.toml') {
+            throw 'codexConfig.destinationPath must be .codex/config.toml.'
+        }
+        if ($null -eq $keyPathsProperty) {
+            throw 'codexConfig.keyPaths is required.'
+        }
+
+        $portableKeys = @(ConvertTo-AgentGuidanceCodexKeyList -Value $keyPathsProperty.Value -Kind Portable -Required)
+        $windowsKeys = @(ConvertTo-AgentGuidanceCodexKeyList -Value $(if ($null -ne $windowsKeyPathsProperty) { $windowsKeyPathsProperty.Value }) -Kind Windows)
+        $removeKeys = @(ConvertTo-AgentGuidanceCodexKeyList -Value $(if ($null -ne $removeKeyPathsProperty) { $removeKeyPathsProperty.Value }) -Kind Remove)
+        $allKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($key in @($portableKeys + $windowsKeys + $removeKeys)) {
+            if (-not $allKeys.Add($key)) {
+                throw "Codex config key appears in more than one projection list: $key"
+            }
+        }
+
+        $codexConfig = [pscustomobject]@{
+            Name = 'Codex config.toml settings'
+            LocalPath = $codexSourcePath
+            RemoteRelativePath = $codexDestination
+            PortableKeys = $portableKeys
+            WindowsKeys = $windowsKeys
+            RemoveKeys = $removeKeys
+        }
+    }
+
+    if ($files.Count -eq 0 -and $null -eq $codexConfig) {
+        throw 'Agent guidance config must contain at least one file mapping or a codexConfig projection.'
+    }
+
     [pscustomobject]@{
         ConfigPath = $resolvedConfigPath
         SourceLabel = $sourceLabel
         Targets = $targets
         Files = $files
+        CodexConfig = $codexConfig
     }
 }
 
@@ -470,6 +633,470 @@ if (-not [IO.File]::Exists(`$path)) {
     [Text.UTF8Encoding]::new($false, $true).GetString([Convert]::FromBase64String($encodedContent))
 }
 
+function Get-AgentGuidanceRemoteContentBytes {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ComputerName,
+
+        [Parameter(Mandatory)]
+        [string] $RemotePath,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Unix', 'Windows')]
+        [string] $Platform
+    )
+
+    if ($Platform -eq 'Windows') {
+        $pathLiteral = ConvertTo-AgentGuidancePowerShellLiteral -Value $RemotePath
+        $script = @"
+`$path = $pathLiteral
+if (-not [IO.File]::Exists(`$path)) {
+    throw 'Remote file is missing: ' + `$path
+}
+`$content = [Convert]::ToBase64String([IO.File]::ReadAllBytes(`$path))
+[Console]::Out.WriteLine('AGENT_GUIDANCE_CONTENT|' + `$content)
+"@
+        $result = Invoke-AgentGuidanceWindowsPowerShell -ComputerName $ComputerName -Script $script
+    }
+    else {
+        $pathLiteral = ConvertTo-AgentGuidanceShellLiteral -Value $RemotePath
+        $command = 'set -eu; test -f ' + $pathLiteral + "; printf 'AGENT_GUIDANCE_CONTENT|'; base64 < " + $pathLiteral + " | tr -d '\r\n'; printf '\n'"
+        $result = Invoke-AgentGuidanceSsh -ComputerName $ComputerName -RemoteCommand $command
+    }
+
+    Assert-AgentGuidanceSuccess -Result $result -Context "Reading content from $ComputerName`:$RemotePath"
+    $contentLine = @($result.Output | Where-Object { $_ -match '^AGENT_GUIDANCE_CONTENT\|' }) | Select-Object -Last 1
+    if (-not $contentLine) {
+        throw "Reading content from $ComputerName`:$RemotePath returned no receipt."
+    }
+
+    try {
+        ,([Convert]::FromBase64String(($contentLine -split '\|', 2)[1]))
+    }
+    catch {
+        throw "Reading content from $ComputerName`:$RemotePath returned invalid base64."
+    }
+}
+
+function New-AgentGuidanceTemporaryCodexHome {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [byte[]] $ConfigBytes
+    )
+
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    $codexHome = Join-Path $temporaryRoot ('agent-guidance-sync-codex-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($codexHome)
+    [IO.File]::WriteAllBytes((Join-Path $codexHome 'config.toml'), $ConfigBytes)
+    $codexHome
+}
+
+function Remove-AgentGuidanceTemporaryCodexHome {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $resolvedPath = [IO.Path]::GetFullPath($Path)
+    $leaf = [IO.Path]::GetFileName($resolvedPath)
+    if (-not $resolvedPath.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -or -not $leaf.StartsWith('agent-guidance-sync-codex-', [StringComparison]::Ordinal)) {
+        throw "Refusing to remove an unexpected temporary Codex home: $resolvedPath"
+    }
+    if (Test-Path -LiteralPath $resolvedPath) {
+        for ($attempt = 1; $attempt -le 20; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $resolvedPath -Recurse -Force -ErrorAction Stop
+                return
+            }
+            catch {
+                if ($attempt -ge 20) {
+                    throw
+                }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+}
+
+function Read-AgentGuidanceCodexResponse {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [Diagnostics.Process] $Process,
+
+        [Parameter(Mandatory)]
+        [long] $Id,
+
+        [int] $TimeoutSeconds = 30
+    )
+
+    while ($true) {
+        $readTask = $Process.StandardOutput.ReadLineAsync()
+        if (-not $readTask.Wait([TimeSpan]::FromSeconds($TimeoutSeconds))) {
+            throw "Codex app-server timed out waiting for response $Id."
+        }
+        $line = $readTask.Result
+        if ($null -eq $line) {
+            throw "Codex app-server exited before returning response $Id."
+        }
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        try {
+            $message = $line | ConvertFrom-Json
+        }
+        catch {
+            throw 'Codex app-server returned a non-JSON response.'
+        }
+        $idProperty = $message.PSObject.Properties['id']
+        if ($null -eq $idProperty -or [long] $idProperty.Value -ne $Id) {
+            continue
+        }
+        $errorProperty = $message.PSObject.Properties['error']
+        if ($null -ne $errorProperty -and $null -ne $errorProperty.Value) {
+            $errorMessageProperty = $errorProperty.Value.PSObject.Properties['message']
+            $errorMessage = if ($null -ne $errorMessageProperty) { [string] $errorMessageProperty.Value } else { 'unknown app-server error' }
+            throw "Codex app-server request failed: $errorMessage"
+        }
+        $resultProperty = $message.PSObject.Properties['result']
+        if ($null -eq $resultProperty) {
+            throw "Codex app-server response $Id contained no result."
+        }
+        return $resultProperty.Value
+    }
+}
+
+function Invoke-AgentGuidanceCodexAppServer {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $CodexHome,
+
+        [Parameter(Mandatory)]
+        [pscustomobject[]] $Request
+    )
+
+    $codexCommand = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $codexCommand) {
+        throw 'Codex CLI is required for semantic config.toml projection but is not available on PATH.'
+    }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $codexCommand.Source
+    [void]$startInfo.ArgumentList.Add('app-server')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = $CodexHome
+    $startInfo.Environment['CODEX_HOME'] = $CodexHome
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $stderrTask = $null
+    $started = $false
+    try {
+        if (-not $process.Start()) {
+            throw 'Codex app-server did not start.'
+        }
+        $started = $true
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        $initialize = [ordered]@{
+            id = 1
+            method = 'initialize'
+            params = [ordered]@{
+                clientInfo = [ordered]@{
+                    name = 'agent-guidance-sync'
+                    version = '0.3.0'
+                }
+            }
+        } | ConvertTo-Json -Compress -Depth 20
+        $process.StandardInput.WriteLine($initialize)
+        $process.StandardInput.Flush()
+        $null = Read-AgentGuidanceCodexResponse -Process $process -Id 1
+        $process.StandardInput.WriteLine((@{ method = 'initialized'; params = @{} } | ConvertTo-Json -Compress))
+        $process.StandardInput.Flush()
+
+        $results = @()
+        $requestId = 100L
+        foreach ($item in $Request) {
+            $payload = [ordered]@{
+                id = $requestId
+                method = $item.Method
+                params = $item.Params
+            } | ConvertTo-Json -Compress -Depth 100
+            $process.StandardInput.WriteLine($payload)
+            $process.StandardInput.Flush()
+            $results += Read-AgentGuidanceCodexResponse -Process $process -Id $requestId
+            $requestId++
+        }
+        $results
+    }
+    catch {
+        $baseMessage = $_.Exception.Message
+        if ($started -and $process.HasExited -and $null -ne $stderrTask -and $stderrTask.IsCompleted) {
+            $stderr = $stderrTask.Result.Trim()
+            if ($stderr) {
+                $baseMessage += ' ' + $stderr.Substring(0, [Math]::Min(1000, $stderr.Length))
+            }
+        }
+        throw $baseMessage
+    }
+    finally {
+        if ($started -and -not $process.HasExited) {
+            $process.StandardInput.Close()
+            if (-not $process.WaitForExit(2000)) {
+                $process.Kill($true)
+                $process.WaitForExit()
+            }
+        }
+        $process.Dispose()
+    }
+}
+
+function Get-AgentGuidanceCodexSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $CodexHome
+    )
+
+    $responses = @(Invoke-AgentGuidanceCodexAppServer -CodexHome $CodexHome -Request @(
+        [pscustomobject]@{
+            Method = 'config/read'
+            Params = [ordered]@{ includeLayers = $true }
+        }
+    ))
+    $response = $responses[0]
+    $userLayer = @($response.layers | Where-Object {
+        $name = $_.name
+        $name.PSObject.Properties['type'] -and $name.type -eq 'user' -and (-not $name.PSObject.Properties['profile'] -or $null -eq $name.profile)
+    }) | Select-Object -First 1
+    if ($null -eq $userLayer) {
+        throw 'Codex app-server returned no writable user config layer.'
+    }
+
+    [pscustomobject]@{
+        Config = ConvertFrom-AgentGuidanceCodexValue -Value $userLayer.config
+        Version = [string] $userLayer.version
+    }
+}
+
+function ConvertFrom-AgentGuidanceCodexValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool] -or $Value -is [ValueType]) {
+        return $Value
+    }
+    if ($Value -is [Collections.IDictionary]) {
+        $converted = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            $converted[[string] $key] = ConvertFrom-AgentGuidanceCodexValue -Value $Value[$key]
+        }
+        return [pscustomobject] $converted
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        return ,@($Value | ForEach-Object { ConvertFrom-AgentGuidanceCodexValue -Value $_ })
+    }
+
+    $properties = @($Value.PSObject.Properties)
+    if ($properties.Count -eq 1 -and $properties[0].Name -ceq '$serde_json::private::Number') {
+        $numberText = [string] $properties[0].Value
+        $integerValue = 0L
+        if ([long]::TryParse($numberText, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref] $integerValue)) {
+            return $integerValue
+        }
+        $floatingValue = 0.0
+        if ([double]::TryParse($numberText, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref] $floatingValue)) {
+            return $floatingValue
+        }
+        throw "Codex app-server returned an invalid TOML number wrapper: $numberText"
+    }
+
+    $converted = [ordered]@{}
+    foreach ($property in $properties) {
+        $converted[$property.Name] = ConvertFrom-AgentGuidanceCodexValue -Value $property.Value
+    }
+    [pscustomobject] $converted
+}
+
+function Get-AgentGuidanceObjectPath {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $InputObject,
+
+        [Parameter(Mandatory)]
+        [string] $KeyPath
+    )
+
+    $value = $InputObject
+    foreach ($segment in $KeyPath.Split('.')) {
+        if ($null -eq $value) {
+            return [pscustomobject]@{ Exists = $false; Value = $null }
+        }
+        if ($value -is [Collections.IDictionary]) {
+            if (-not $value.Contains($segment)) {
+                return [pscustomobject]@{ Exists = $false; Value = $null }
+            }
+            $value = $value[$segment]
+            continue
+        }
+        $property = $value.PSObject.Properties[$segment]
+        if ($null -eq $property) {
+            return [pscustomobject]@{ Exists = $false; Value = $null }
+        }
+        $value = $property.Value
+    }
+
+    [pscustomobject]@{ Exists = $true; Value = $value }
+}
+
+function ConvertTo-AgentGuidanceConfigDisplayValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return 'null'
+    }
+    $Value | ConvertTo-Json -Compress -Depth 20
+}
+
+function Test-AgentGuidanceConfigValueEqual {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $First,
+
+        [AllowNull()]
+        $Second
+    )
+
+    (ConvertTo-AgentGuidanceConfigDisplayValue -Value $First) -ceq (ConvertTo-AgentGuidanceConfigDisplayValue -Value $Second)
+}
+
+function Get-AgentGuidanceCodexSourceSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ConfigPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        throw "Required Codex source config is missing: $ConfigPath"
+    }
+    $codexHome = New-AgentGuidanceTemporaryCodexHome -ConfigBytes ([IO.File]::ReadAllBytes($ConfigPath))
+    try {
+        Get-AgentGuidanceCodexSnapshot -CodexHome $codexHome
+    }
+    finally {
+        Remove-AgentGuidanceTemporaryCodexHome -Path $codexHome
+    }
+}
+
+function New-AgentGuidanceCodexCandidate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [byte[]] $TargetConfigBytes,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $SourceSnapshot,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $CodexConfig,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Unix', 'Windows')]
+        [string] $Platform
+    )
+
+    $codexHome = New-AgentGuidanceTemporaryCodexHome -ConfigBytes $TargetConfigBytes
+    try {
+        $targetSnapshot = Get-AgentGuidanceCodexSnapshot -CodexHome $codexHome
+        $edits = @()
+        $changes = @()
+        $setKeys = @($CodexConfig.PortableKeys)
+        if ($Platform -eq 'Windows') {
+            $setKeys += @($CodexConfig.WindowsKeys)
+        }
+
+        foreach ($key in $setKeys) {
+            $sourceValue = Get-AgentGuidanceObjectPath -InputObject $SourceSnapshot.Config -KeyPath $key
+            if (-not $sourceValue.Exists) {
+                throw "The source Codex config does not define required projected key '$key'."
+            }
+            $targetValue = Get-AgentGuidanceObjectPath -InputObject $targetSnapshot.Config -KeyPath $key
+            if ($targetValue.Exists -and (Test-AgentGuidanceConfigValueEqual -First $targetValue.Value -Second $sourceValue.Value)) {
+                continue
+            }
+
+            $edits += [ordered]@{ keyPath = $key; value = $sourceValue.Value; mergeStrategy = 'replace' }
+            $changes += [pscustomobject]@{
+                Action = 'Set'
+                KeyPath = $key
+                Current = if ($targetValue.Exists) { ConvertTo-AgentGuidanceConfigDisplayValue -Value $targetValue.Value } else { '<absent>' }
+                Desired = ConvertTo-AgentGuidanceConfigDisplayValue -Value $sourceValue.Value
+            }
+        }
+        foreach ($key in $CodexConfig.RemoveKeys) {
+            $targetValue = Get-AgentGuidanceObjectPath -InputObject $targetSnapshot.Config -KeyPath $key
+            if (-not $targetValue.Exists) {
+                continue
+            }
+            $edits += [ordered]@{ keyPath = $key; value = $null; mergeStrategy = 'replace' }
+            $changes += [pscustomobject]@{
+                Action = 'Remove'
+                KeyPath = $key
+                Current = ConvertTo-AgentGuidanceConfigDisplayValue -Value $targetValue.Value
+                Desired = '<removed>'
+            }
+        }
+
+        if ($edits.Count -gt 0) {
+            $null = @(Invoke-AgentGuidanceCodexAppServer -CodexHome $codexHome -Request @(
+                [pscustomobject]@{
+                    Method = 'config/batchWrite'
+                    Params = [ordered]@{
+                        edits = $edits
+                        expectedVersion = $targetSnapshot.Version
+                        reloadUserConfig = $false
+                    }
+                }
+            ))
+            $null = Get-AgentGuidanceCodexSnapshot -CodexHome $codexHome
+        }
+
+        $candidatePath = Join-Path $codexHome 'config.toml'
+        [pscustomobject]@{
+            LocalPath = $candidatePath
+            LocalHash = (Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Changes = $changes
+            TemporaryDirectory = $codexHome
+        }
+    }
+    catch {
+        Remove-AgentGuidanceTemporaryCodexHome -Path $codexHome
+        throw
+    }
+}
+
 function Set-AgentGuidanceWindowsStage {
     [CmdletBinding()]
     param(
@@ -507,6 +1134,7 @@ function Get-AgentGuidanceInventory {
         [string[]] $ComputerName,
 
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [pscustomobject[]] $File
     )
 
@@ -535,7 +1163,7 @@ if ([string]::IsNullOrWhiteSpace($homePath)) {
             }
         }
         else {
-            $preflightCommand = 'set -eu; for command_name in sha256sum diff cp mv mkdir chmod rm; do command -v "$command_name" >/dev/null; done; printf "ok\n"'
+            $preflightCommand = 'set -eu; for command_name in sha256sum diff cp mv mkdir chmod rm base64 tr; do command -v "$command_name" >/dev/null; done; printf "ok\n"'
             $preflight = Invoke-AgentGuidanceSsh -ComputerName $computer -RemoteCommand $preflightCommand
             Assert-AgentGuidanceSuccess -Result $preflight -Context "Unix SSH preflight for $computer"
 
@@ -560,12 +1188,17 @@ if ([string]::IsNullOrWhiteSpace($homePath)) {
 
             $remoteFiles += [pscustomobject]@{
                 Name = $item.Name
+                Kind = 'ExactFile'
                 LocalPath = $item.LocalPath
                 LocalHash = $item.LocalHash
+                RemoteRelativePath = $item.RemoteRelativePath
                 RemotePath = $remotePath
                 RemoteHash = $remoteHash
                 Status = $status
                 Platform = $platform
+                NewFileMode = '644'
+                Changes = @()
+                TemporaryDirectory = $null
             }
         }
 
@@ -578,6 +1211,105 @@ if ([string]::IsNullOrWhiteSpace($homePath)) {
     }
 
     $inventory
+}
+
+function Add-AgentGuidanceCodexConfigInventory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject[]] $Inventory,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $CodexConfig,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $SourceSnapshot
+    )
+
+    $createdHomes = @()
+    try {
+        foreach ($target in $Inventory) {
+            $remotePath = if ($target.Platform -eq 'Windows') {
+                $target.RemoteHome.TrimEnd('\') + '\' + $CodexConfig.RemoteRelativePath.Replace('/', '\')
+            }
+            else {
+                $target.RemoteHome.TrimEnd('/') + '/' + $CodexConfig.RemoteRelativePath
+            }
+            $remoteHash = Get-AgentGuidanceRemoteHash `
+                -ComputerName $target.ComputerName `
+                -RemotePath $remotePath `
+                -Platform $target.Platform
+            $remoteBytes = if ($remoteHash -eq 'MISSING') {
+                ,([byte[]]::new(0))
+            }
+            else {
+                Get-AgentGuidanceRemoteContentBytes `
+                    -ComputerName $target.ComputerName `
+                    -RemotePath $remotePath `
+                    -Platform $target.Platform
+            }
+            if ($remoteHash -ne 'MISSING') {
+                $downloadedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($remoteBytes)).ToLowerInvariant()
+                if ($downloadedHash -ne $remoteHash) {
+                    throw "Codex config changed while it was being read from $($target.ComputerName); rerun the preview."
+                }
+            }
+
+            $candidate = New-AgentGuidanceCodexCandidate `
+                -TargetConfigBytes $remoteBytes `
+                -SourceSnapshot $SourceSnapshot `
+                -CodexConfig $CodexConfig `
+                -Platform $target.Platform
+            $createdHomes += $candidate.TemporaryDirectory
+            $status = if ($remoteHash -eq $candidate.LocalHash) { 'Current' } elseif ($remoteHash -eq 'MISSING') { 'Missing' } else { 'Different' }
+            $target.Files = @($target.Files) + [pscustomobject]@{
+                Name = $CodexConfig.Name
+                Kind = 'CodexConfig'
+                LocalPath = $candidate.LocalPath
+                LocalHash = $candidate.LocalHash
+                RemoteRelativePath = $CodexConfig.RemoteRelativePath
+                RemotePath = $remotePath
+                RemoteHash = $remoteHash
+                Status = $status
+                Platform = $target.Platform
+                NewFileMode = '600'
+                Changes = @($candidate.Changes)
+                TemporaryDirectory = $candidate.TemporaryDirectory
+            }
+        }
+    }
+    catch {
+        foreach ($codexHome in $createdHomes) {
+            if (Test-Path -LiteralPath $codexHome) {
+                Remove-AgentGuidanceTemporaryCodexHome -Path $codexHome
+            }
+        }
+        throw
+    }
+
+    $Inventory
+}
+
+function Remove-AgentGuidanceInventoryTemporaryFiles {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [pscustomobject[]] $Inventory = @()
+    )
+
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($target in $Inventory) {
+        foreach ($item in $target.Files) {
+            $temporaryProperty = $item.PSObject.Properties['TemporaryDirectory']
+            if ($null -eq $temporaryProperty -or [string]::IsNullOrWhiteSpace([string] $temporaryProperty.Value)) {
+                continue
+            }
+            $temporaryDirectory = [string] $temporaryProperty.Value
+            if ($seen.Add($temporaryDirectory) -and (Test-Path -LiteralPath $temporaryDirectory)) {
+                Remove-AgentGuidanceTemporaryCodexHome -Path $temporaryDirectory
+            }
+        }
+    }
 }
 
 function Show-AgentGuidancePreview {
@@ -595,8 +1327,23 @@ function Show-AgentGuidancePreview {
         Write-Host $target.ComputerName -ForegroundColor Yellow
 
         foreach ($item in $target.Files) {
+            $kind = if ($item.PSObject.Properties['Kind']) { [string] $item.Kind } else { 'ExactFile' }
             if ($item.Status -eq 'Current') {
                 Write-Host "  $($item.Name): current" -ForegroundColor Green
+                continue
+            }
+
+            if ($kind -eq 'CodexConfig') {
+                $state = if ($item.Status -eq 'Missing') { 'missing; it will be created' } else { 'settings differ' }
+                Write-Host "  $($item.Name): $state" -ForegroundColor Magenta
+                foreach ($change in $item.Changes) {
+                    if ($change.Action -eq 'Remove') {
+                        Write-Host "    - $($change.KeyPath) (currently $($change.Current))"
+                    }
+                    else {
+                        Write-Host "    ~ $($change.KeyPath): $($change.Current) -> $($change.Desired)"
+                    }
+                }
                 continue
             }
 
@@ -676,7 +1423,10 @@ function New-AgentGuidanceCommitCommand {
         [string] $BackupSuffix,
 
         [Parameter(Mandatory)]
-        [string] $DisplayName
+        [string] $DisplayName,
+
+        [ValidateSet('600', '644')]
+        [string] $NewFileMode = '644'
     )
 
     $template = @'
@@ -687,6 +1437,7 @@ expected=__EXPECTED__
 wanted=__WANTED__
 backup_suffix=__BACKUP_SUFFIX__
 display_name=__DISPLAY_NAME__
+new_file_mode=__NEW_FILE_MODE__
 
 current=MISSING
 if [ -f "$destination" ]; then
@@ -722,7 +1473,7 @@ if [ -f "$destination" ]; then
     cp -p -- "$destination" "$backup"
     chmod --reference="$destination" "$stage"
 else
-    chmod 644 "$stage"
+    chmod "$new_file_mode" "$stage"
 fi
 
 mv -- "$stage" "$destination"
@@ -746,7 +1497,8 @@ printf 'UPDATED|%s|%s|%s|%s\n' "$display_name" "$destination" "$backup" "$actual
         Replace('__EXPECTED__', (ConvertTo-AgentGuidanceShellLiteral -Value $ExpectedHash)).
         Replace('__WANTED__', (ConvertTo-AgentGuidanceShellLiteral -Value $WantedHash)).
         Replace('__BACKUP_SUFFIX__', (ConvertTo-AgentGuidanceShellLiteral -Value $BackupSuffix)).
-        Replace('__DISPLAY_NAME__', (ConvertTo-AgentGuidanceShellLiteral -Value $DisplayName))
+        Replace('__DISPLAY_NAME__', (ConvertTo-AgentGuidanceShellLiteral -Value $DisplayName)).
+        Replace('__NEW_FILE_MODE__', (ConvertTo-AgentGuidanceShellLiteral -Value $NewFileMode))
 }
 
 function New-AgentGuidanceWindowsCommitScript {
@@ -836,12 +1588,13 @@ if ($actual -ne $wanted) {
 function Sync-AgentGuidance {
     <#
     .SYNOPSIS
-    Previews or applies local agent-guidance files to remote hosts over SSH.
+    Previews or applies local agent guidance and selected Codex settings over SSH.
 
     .DESCRIPTION
-    Reads source files, target SSH aliases, and home-relative destination paths
-    from a JSON config. Without -Apply, shows differences and makes no changes.
-    With -Apply, stages every file first, fences against concurrent remote edits,
+    Reads source files, an optional allowlisted Codex config projection, target
+    SSH aliases, and home-relative destination paths from a JSON config. Without
+    -Apply, shows differences and makes no changes. With -Apply, stages every
+    target-specific payload first, fences against concurrent remote edits,
     creates timestamped backups, replaces each file atomically, and verifies
     SHA-256 readback.
 
@@ -890,25 +1643,39 @@ function Sync-AgentGuidance {
         $item | Add-Member -NotePropertyName LocalHash -NotePropertyValue ((Get-FileHash -LiteralPath $item.LocalPath -Algorithm SHA256).Hash.ToLowerInvariant())
     }
 
-    Write-Host "Agent guidance source: $($config.SourceLabel)" -ForegroundColor Cyan
-    Write-Host "Config: $($config.ConfigPath)" -ForegroundColor DarkGray
-    $inventory = @(Get-AgentGuidanceInventory -ComputerName $targets -File $files)
-    Show-AgentGuidancePreview -Inventory $inventory -SourceLabel $config.SourceLabel
-
-    if (-not $Apply) {
-        Write-Host ''
-        Write-Host 'Preview complete. No files were changed. Run Sync-AgentGuidance -Apply to apply this exact source state.' -ForegroundColor Cyan
-        return
-    }
-
-    $token = [guid]::NewGuid().ToString('N').Substring(0, 10)
-    $backupSuffix = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + $token
-    $staged = @()
-
+    $inventory = @()
     try {
-        Write-Host ''
-        Write-Host 'Staging files on every target before changing any destination...' -ForegroundColor Cyan
-        foreach ($target in $inventory) {
+        $sourceSnapshot = if ($null -ne $config.CodexConfig) {
+            Get-AgentGuidanceCodexSourceSnapshot -ConfigPath $config.CodexConfig.LocalPath
+        }
+        else {
+            $null
+        }
+        Write-Host "Agent guidance source: $($config.SourceLabel)" -ForegroundColor Cyan
+        Write-Host "Config: $($config.ConfigPath)" -ForegroundColor DarkGray
+        $inventory = @(Get-AgentGuidanceInventory -ComputerName $targets -File $files)
+        if ($null -ne $config.CodexConfig) {
+            $inventory = @(Add-AgentGuidanceCodexConfigInventory `
+                -Inventory $inventory `
+                -CodexConfig $config.CodexConfig `
+                -SourceSnapshot $sourceSnapshot)
+        }
+        Show-AgentGuidancePreview -Inventory $inventory -SourceLabel $config.SourceLabel
+
+        if (-not $Apply) {
+            Write-Host ''
+            Write-Host 'Preview complete. No files were changed. Run Sync-AgentGuidance -Apply to apply this exact source state.' -ForegroundColor Cyan
+            return
+        }
+
+        $token = [guid]::NewGuid().ToString('N').Substring(0, 10)
+        $backupSuffix = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + $token
+        $staged = @()
+
+        try {
+            Write-Host ''
+            Write-Host 'Staging files on every target before changing any destination...' -ForegroundColor Cyan
+            foreach ($target in $inventory) {
             if ($target.Platform -eq 'Unix') {
                 $directories = @(
                     $target.Files |
@@ -922,15 +1689,21 @@ function Sync-AgentGuidance {
 
             foreach ($item in $target.Files) {
                 $remoteDirectory = Get-AgentGuidanceRemoteDirectory -RemotePath $item.RemotePath -Platform $target.Platform
+                $stageLeaf = if ($target.Platform -eq 'Windows') {
+                    [IO.Path]::GetFileName($item.RemotePath)
+                }
+                else {
+                    ($item.RemotePath -split '/')[-1]
+                }
                 if ($target.Platform -eq 'Windows') {
-                    $stagePath = $remoteDirectory.TrimEnd('\') + '\.' + $item.Name + '.sync-' + $token + '.tmp'
+                    $stagePath = $remoteDirectory.TrimEnd('\') + '\.' + $stageLeaf + '.sync-' + $token + '.tmp'
                     Set-AgentGuidanceWindowsStage `
                         -ComputerName $target.ComputerName `
                         -StagePath $stagePath `
                         -LocalPath $item.LocalPath
                 }
                 else {
-                    $stagePath = $remoteDirectory.TrimEnd('/') + '/.' + $item.Name + '.sync-' + $token + '.tmp'
+                    $stagePath = $remoteDirectory.TrimEnd('/') + '/.' + $stageLeaf + '.sync-' + $token + '.tmp'
                     $scpArguments = @(
                         '-q',
                         '-o', 'BatchMode=yes',
@@ -958,6 +1731,7 @@ function Sync-AgentGuidance {
                     ExpectedHash = $item.RemoteHash
                     WantedHash = $item.LocalHash
                     Platform = $target.Platform
+                    NewFileMode = $item.NewFileMode
                 }
             }
         }
@@ -984,7 +1758,8 @@ function Sync-AgentGuidance {
                     -ExpectedHash $item.ExpectedHash `
                     -WantedHash $item.WantedHash `
                     -BackupSuffix $backupSuffix `
-                    -DisplayName $item.Name
+                    -DisplayName $item.Name `
+                    -NewFileMode $item.NewFileMode
                 $commit = Invoke-AgentGuidanceSsh -ComputerName $item.ComputerName -RemoteCommand $commitCommand
             }
             Assert-AgentGuidanceSuccess -Result $commit -Context "Applying $($item.Name) on $($item.ComputerName)"
@@ -1021,19 +1796,23 @@ function Sync-AgentGuidance {
         Write-Host ''
         $results | Format-Table ComputerName, File, Status, Backup, SHA256 -AutoSize
         Write-Host 'Sync complete. Existing Codex and Claude sessions may retain their startup instructions; start a new session to load the new files.' -ForegroundColor Green
-    }
-    finally {
-        foreach ($item in $staged) {
-            if ($item.Platform -eq 'Windows') {
-                $stageLiteral = ConvertTo-AgentGuidancePowerShellLiteral -Value $item.StagePath
-                $cleanupScript = "if ([IO.File]::Exists($stageLiteral)) { [IO.File]::Delete($stageLiteral) }"
-                $null = Invoke-AgentGuidanceWindowsPowerShell -ComputerName $item.ComputerName -Script $cleanupScript
-            }
-            else {
-                $stageLiteral = ConvertTo-AgentGuidanceShellLiteral -Value $item.StagePath
-                $null = Invoke-AgentGuidanceSsh -ComputerName $item.ComputerName -RemoteCommand ('rm -f -- ' + $stageLiteral)
+        }
+        finally {
+            foreach ($item in $staged) {
+                if ($item.Platform -eq 'Windows') {
+                    $stageLiteral = ConvertTo-AgentGuidancePowerShellLiteral -Value $item.StagePath
+                    $cleanupScript = "if ([IO.File]::Exists($stageLiteral)) { [IO.File]::Delete($stageLiteral) }"
+                    $null = Invoke-AgentGuidanceWindowsPowerShell -ComputerName $item.ComputerName -Script $cleanupScript
+                }
+                else {
+                    $stageLiteral = ConvertTo-AgentGuidanceShellLiteral -Value $item.StagePath
+                    $null = Invoke-AgentGuidanceSsh -ComputerName $item.ComputerName -RemoteCommand ('rm -f -- ' + $stageLiteral)
+                }
             }
         }
+    }
+    finally {
+        Remove-AgentGuidanceInventoryTemporaryFiles -Inventory $inventory
     }
 }
 

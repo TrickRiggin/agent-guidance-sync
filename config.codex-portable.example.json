@@ -1,0 +1,59 @@
+{
+  "sourceLabel": "primary-workstation",
+  "targets": [
+    "host-one",
+    "host-two"
+  ],
+  "files": [
+    {
+      "name": "AGENTS.md",
+      "sourcePath": "~/.codex/AGENTS.md",
+      "destinationPath": ".codex/AGENTS.md"
+    },
+    {
+      "name": "CLAUDE.md",
+      "sourcePath": "~/.claude/CLAUDE.md",
+      "destinationPath": ".claude/CLAUDE.md"
+    }
+  ],
+  "codexConfig": {
+    "sourcePath": "~/.codex/config.toml",
+    "destinationPath": ".codex/config.toml",
+    "keyPaths": [
+      "model",
+      "model_reasoning_effort",
+      "personality",
+      "service_tier",
+      "suppress_unstable_features_warning",
+      "approval_policy",
+      "approvals_reviewer",
+      "sandbox_mode",
+      "memories.generate_memories",
+      "memories.use_memories",
+      "features.goals",
+      "features.memories",
+      "features.mentions_v2",
+      "features.artifact",
+      "features.multi_agent",
+      "features.default_mode_request_user_input",
+      "desktop.conversationDetailMode",
+      "desktop.sansFontSize",
+      "desktop.codeFontSize",
+      "desktop.ambient-suggestions-enabled",
+      "desktop.followUpQueueMode",
+      "desktop.keepRemoteControlAwakeWhilePluggedIn",
+      "tui.status_line",
+      "tui.status_line_use_colors"
+    ],
+    "windowsKeyPaths": [
+      "windows.sandbox"
+    ],
+    "removeKeyPaths": [
+      "features.generate_memories",
+      "features.use_memories",
+      "features.js_repl",
+      "features.terminal_resize_reflow",
+      "tui.tui.transcript_syntax_highlight"
+    ]
+  }
+}
