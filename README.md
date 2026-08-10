@@ -13,10 +13,13 @@ It started as a way to keep Codex `AGENTS.md` and Claude `CLAUDE.md` aligned acr
 - Existing files receive timestamped backups.
 - Replacement is atomic on Unix and Windows.
 - Final content is read back and independently hash-verified.
+- Targets with a hard SSH reachability failure are reported and skipped while reachable targets continue.
 - Unix and Windows targets are detected automatically.
 - Codex settings are edited with Codex's own version-fenced config API; unowned TOML survives on each target.
 
 This is not a distributed transaction across the whole fleet. A host can still fail after an earlier host commits. The operation is deliberately rerunnable, and every changed destination retains a backup.
+
+An unavailable target is skipped only when its initial SSH probe reports a hard network failure such as a timeout, refused connection, missing route, or unresolved hostname. Authentication failures, host-key failures, missing remote tools, invalid paths, and failures after inventory begins still stop the run. If every configured target is unavailable, the command fails without changing anything.
 
 ## Requirements
 
