@@ -223,6 +223,18 @@ pwsh -NoProfile -File ./tests/Test-AgentGuidanceSync.ps1
 
 It validates config boundaries, semantic TOML preservation, target isolation, safe preview output, escaping, module exports, generated commit logic, stale-hash rejection, corrupt-stage rejection, backups, atomic replacement, and readback receipts without touching a remote host.
 
+## Release
+
+Update the matching versions in `package.json` and `AgentGuidanceSync/AgentGuidanceSync.psd1`, merge the change to `main`, then push an annotated version tag:
+
+```powershell
+$version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+git tag -a "v$version" -m "agent-guidance-sync $version"
+git push origin "v$version"
+```
+
+The tag must exactly match the npm version with a `v` prefix. GitHub Actions tests the tagged source and publishes through npm trusted publishing; no npm token is stored in GitHub.
+
 ## License
 
 [MIT](LICENSE)
