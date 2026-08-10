@@ -202,6 +202,18 @@ try {
         Assert-Equal -Expected ([switch].FullName) -Actual $applyParameter.ParameterType.FullName -Because 'remote writes should require an explicit switch'
     }
 
+    Test-Case 'npm package metadata matches the PowerShell module' {
+        $packagePath = Join-Path $repositoryRoot 'package.json'
+        $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
+        Assert-Equal -Expected 'agent-guidance-sync' -Actual $package.name -Because 'the public npm name should match the repository'
+        Assert-Equal -Expected $manifest.Version.ToString() -Actual $package.version -Because 'npm and PowerShell versions should be released together'
+        Assert-Equal -Expected 'public' -Actual $package.publishConfig.access -Because 'the unscoped package should be explicitly public'
+
+        $cliRelativePath = $package.bin.'agent-guidance-sync'
+        Assert-Equal -Expected 'bin/agent-guidance-sync.ps1' -Actual $cliRelativePath -Because 'npm should expose one stable command'
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $repositoryRoot $cliRelativePath) -PathType Leaf) -Because 'the npm command target should exist'
+    }
+
     Test-Case 'literal escaping and remote directory parsing are platform-safe' {
         $shellLiteral = & $module { ConvertTo-AgentGuidanceShellLiteral -Value "a'b" }
         $expectedShellLiteral = @'

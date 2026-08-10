@@ -16,6 +16,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
       - name: Run module tests
         shell: pwsh
         run: ./tests/Test-AgentGuidanceSync.ps1
+      - name: Verify npm package contents
+        run: npm pack --dry-run --ignore-scripts
