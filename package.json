@@ -1,0 +1,40 @@
+{
+  "name": "agent-guidance-sync",
+  "version": "0.3.0",
+  "description": "Preview-first synchronization of agent guidance files and portable Codex settings over SSH.",
+  "license": "MIT",
+  "author": "Austin Arlt",
+  "homepage": "https://github.com/TrickRiggin/agent-guidance-sync#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TrickRiggin/agent-guidance-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TrickRiggin/agent-guidance-sync/issues"
+  },
+  "keywords": [
+    "powershell",
+    "codex",
+    "claude",
+    "ssh",
+    "configuration",
+    "agent-guidance"
+  ],
+  "bin": {
+    "agent-guidance-sync": "bin/agent-guidance-sync.ps1"
+  },
+  "files": [
+    "AgentGuidanceSync/",
+    "bin/",
+    "config.example.json",
+    "config.multi-harness.example.json",
+    "config.codex-portable.example.json"
+  ],
+  "scripts": {
+    "test": "pwsh -NoProfile -File ./tests/Test-AgentGuidanceSync.ps1",
+    "prepack": "npm test"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

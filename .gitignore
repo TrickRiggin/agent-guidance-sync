@@ -6,6 +6,8 @@ config.json
 *.bak.*
 *.tmp
 .scratch/
+node_modules/
+*.tgz
 
 # Editor and OS noise
 .DS_Store

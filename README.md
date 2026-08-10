@@ -49,7 +49,15 @@ Never copy a private key to the repository or to the destination machines.
 
 ## Install
 
-From the repository root:
+Install the published CLI from npm:
+
+```powershell
+npm install --global agent-guidance-sync
+```
+
+This installs the `agent-guidance-sync` command. PowerShell 7.2 or newer is still required at runtime; npm is the delivery mechanism, not a JavaScript rewrite.
+
+To install directly from a repository clone instead, run:
 
 ```powershell
 pwsh -NoProfile -File ./install.ps1
@@ -65,15 +73,20 @@ The installer refuses to replace an existing `AgentGuidanceSync` installation un
 
 ## Configure
 
-Copy [`config.example.json`](config.example.json) to the default private location:
+Create the default private configuration directory and put your `config.json` there:
 
 ```powershell
 $configDirectory = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config/agent-guidance-sync'
 New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+```
+
+If you are working from a repository clone, [`config.example.json`](config.example.json) is a copy-ready starter:
+
+```powershell
 Copy-Item ./config.example.json (Join-Path $configDirectory 'config.json')
 ```
 
-Then edit the private config:
+For an npm installation, create `config.json` using this same starter structure:
 
 ```json
 {
@@ -160,7 +173,26 @@ OMP can read several other harness conventions, but creating its native `~/.omp/
 
 ## Use
 
-Preview the entire configured fleet:
+Preview the entire configured fleet with the npm-installed CLI:
+
+```powershell
+agent-guidance-sync
+```
+
+Apply exactly what was previewed:
+
+```powershell
+agent-guidance-sync -Apply
+```
+
+Limit a run to one or more targets:
+
+```powershell
+agent-guidance-sync -ComputerName host-one
+agent-guidance-sync -ComputerName host-one,host-two -Apply
+```
+
+If you installed the module directly from a clone, use its PowerShell command instead:
 
 ```powershell
 Sync-AgentGuidance
@@ -172,7 +204,7 @@ Apply exactly what was previewed:
 Sync-AgentGuidance -Apply
 ```
 
-Limit a run to one or more targets:
+The same parameters are available:
 
 ```powershell
 Sync-AgentGuidance -ComputerName host-one
