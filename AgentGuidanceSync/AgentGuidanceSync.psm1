@@ -128,12 +128,38 @@ function Assert-AgentGuidanceSuccess {
         return
     }
 
-    $detail = ($Result.Output -join [Environment]::NewLine).Trim()
-    if (-not $detail) {
-        $detail = 'No command output was returned.'
+    $detail = Get-AgentGuidanceNativeFailureDetail -Result $Result
+    throw "$Context failed with exit code $($Result.ExitCode): $detail"
+}
+
+function Get-AgentGuidanceNativeFailureDetail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Result
+    )
+
+    $detail = (@($Result.Output) | Where-Object { $null -ne $_ } | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ }) -join '; '
+    if ([string]::IsNullOrWhiteSpace($detail)) {
+        return 'No command output was returned.'
     }
 
-    throw "$Context failed with exit code $($Result.ExitCode): $detail"
+    $detail
+}
+
+function Test-AgentGuidanceSshUnavailable {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Result
+    )
+
+    if ($Result.ExitCode -ne 255) {
+        return $false
+    }
+
+    $detail = Get-AgentGuidanceNativeFailureDetail -Result $Result
+    $detail -match '(?i)(timed out|connection refused|no route to host|network is unreachable|host is down|could not resolve hostname|temporary failure in name resolution|name or service not known|nodename nor servname provided)'
 }
 
 function ConvertTo-AgentGuidanceShellLiteral {
@@ -505,7 +531,37 @@ function Import-AgentGuidanceConfig {
     }
 }
 
-function Get-AgentGuidanceRemotePlatform {
+function Resolve-AgentGuidanceTargetConnection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Probe
+    )
+
+    if ($Probe.ExitCode -eq 0 -and ($Probe.Output | Where-Object { $_ -eq 'AGENT_GUIDANCE_PLATFORM|Windows' })) {
+        return [pscustomobject]@{
+            Availability = 'Reachable'
+            Platform = 'Windows'
+            Failure = $null
+        }
+    }
+
+    if (Test-AgentGuidanceSshUnavailable -Result $Probe) {
+        return [pscustomobject]@{
+            Availability = 'Unavailable'
+            Platform = $null
+            Failure = Get-AgentGuidanceNativeFailureDetail -Result $Probe
+        }
+    }
+
+    [pscustomobject]@{
+        Availability = 'Reachable'
+        Platform = 'Unix'
+        Failure = $null
+    }
+}
+
+function Get-AgentGuidanceTargetConnection {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -515,11 +571,7 @@ function Get-AgentGuidanceRemotePlatform {
     $probe = Invoke-AgentGuidanceWindowsPowerShell `
         -ComputerName $ComputerName `
         -Script "[Console]::Out.WriteLine('AGENT_GUIDANCE_PLATFORM|Windows')"
-    if ($probe.ExitCode -eq 0 -and ($probe.Output | Where-Object { $_ -eq 'AGENT_GUIDANCE_PLATFORM|Windows' })) {
-        return 'Windows'
-    }
-
-    'Unix'
+    Resolve-AgentGuidanceTargetConnection -Probe $probe
 }
 
 function Get-AgentGuidanceRemoteDirectory {
@@ -1142,7 +1194,20 @@ function Get-AgentGuidanceInventory {
     foreach ($computer in $ComputerName) {
         Write-Host "Checking $computer..." -ForegroundColor Cyan
 
-        $platform = Get-AgentGuidanceRemotePlatform -ComputerName $computer
+        $connection = Get-AgentGuidanceTargetConnection -ComputerName $computer
+        if ($connection.Availability -eq 'Unavailable') {
+            $inventory += [pscustomobject]@{
+                ComputerName = $computer
+                Availability = 'Unavailable'
+                Failure = $connection.Failure
+                RemoteHome = $null
+                Platform = $null
+                Files = @()
+            }
+            continue
+        }
+
+        $platform = $connection.Platform
         if ($platform -eq 'Windows') {
             $preflightScript = @'
 $homePath = [Environment]::GetFolderPath('UserProfile')
@@ -1204,6 +1269,8 @@ if ([string]::IsNullOrWhiteSpace($homePath)) {
 
         $inventory += [pscustomobject]@{
             ComputerName = $computer
+            Availability = 'Reachable'
+            Failure = $null
             RemoteHome = $remoteHome
             Platform = $platform
             Files = $remoteFiles
@@ -1229,6 +1296,10 @@ function Add-AgentGuidanceCodexConfigInventory {
     $createdHomes = @()
     try {
         foreach ($target in $Inventory) {
+            if ($target.PSObject.Properties['Availability'] -and $target.Availability -eq 'Unavailable') {
+                continue
+            }
+
             $remotePath = if ($target.Platform -eq 'Windows') {
                 $target.RemoteHome.TrimEnd('\') + '\' + $CodexConfig.RemoteRelativePath.Replace('/', '\')
             }
@@ -1325,6 +1396,11 @@ function Show-AgentGuidancePreview {
     foreach ($target in $Inventory) {
         Write-Host ''
         Write-Host $target.ComputerName -ForegroundColor Yellow
+
+        if ($target.PSObject.Properties['Availability'] -and $target.Availability -eq 'Unavailable') {
+            Write-Host "  unavailable; skipped: $($target.Failure)" -ForegroundColor DarkYellow
+            continue
+        }
 
         foreach ($item in $target.Files) {
             $kind = if ($item.PSObject.Properties['Kind']) { [string] $item.Kind } else { 'ExactFile' }
@@ -1596,7 +1672,9 @@ function Sync-AgentGuidance {
     -Apply, shows differences and makes no changes. With -Apply, stages every
     target-specific payload first, fences against concurrent remote edits,
     creates timestamped backups, replaces each file atomically, and verifies
-    SHA-256 readback.
+    SHA-256 readback. Targets with a hard SSH reachability failure during the
+    initial probe are reported and skipped. Authentication, host-key, preflight,
+    staging, commit, and verification failures still stop the run.
 
     .EXAMPLE
     Sync-AgentGuidance
@@ -1654,6 +1732,8 @@ function Sync-AgentGuidance {
         Write-Host "Agent guidance source: $($config.SourceLabel)" -ForegroundColor Cyan
         Write-Host "Config: $($config.ConfigPath)" -ForegroundColor DarkGray
         $inventory = @(Get-AgentGuidanceInventory -ComputerName $targets -File $files)
+        $reachableInventory = @($inventory | Where-Object { $_.Availability -eq 'Reachable' })
+        $skippedInventory = @($inventory | Where-Object { $_.Availability -eq 'Unavailable' })
         if ($null -ne $config.CodexConfig) {
             $inventory = @(Add-AgentGuidanceCodexConfigInventory `
                 -Inventory $inventory `
@@ -1662,9 +1742,18 @@ function Sync-AgentGuidance {
         }
         Show-AgentGuidancePreview -Inventory $inventory -SourceLabel $config.SourceLabel
 
+        if ($reachableInventory.Count -eq 0) {
+            $unavailableNames = @($skippedInventory.ComputerName) -join ', '
+            throw "No configured targets are reachable. No files were changed. Unavailable targets: $unavailableNames."
+        }
+
         if (-not $Apply) {
             Write-Host ''
-            Write-Host 'Preview complete. No files were changed. Run Sync-AgentGuidance -Apply to apply this exact source state.' -ForegroundColor Cyan
+            $previewMessage = "Preview complete for $($reachableInventory.Count) reachable target(s). No files were changed."
+            if ($skippedInventory.Count -gt 0) {
+                $previewMessage += " Skipped unavailable targets: $(@($skippedInventory.ComputerName) -join ', ')."
+            }
+            Write-Host "$previewMessage Run Sync-AgentGuidance -Apply to apply this exact source state." -ForegroundColor Cyan
             return
         }
 
@@ -1674,8 +1763,8 @@ function Sync-AgentGuidance {
 
         try {
             Write-Host ''
-            Write-Host 'Staging files on every target before changing any destination...' -ForegroundColor Cyan
-            foreach ($target in $inventory) {
+            Write-Host 'Staging files on every reachable target before changing any destination...' -ForegroundColor Cyan
+            foreach ($target in $reachableInventory) {
             if ($target.Platform -eq 'Unix') {
                 $directories = @(
                     $target.Files |
@@ -1781,7 +1870,7 @@ function Sync-AgentGuidance {
         }
 
         Write-Host 'Verifying each destination independently...' -ForegroundColor Cyan
-        foreach ($target in $inventory) {
+        foreach ($target in $reachableInventory) {
             foreach ($item in $target.Files) {
                 $verifiedHash = Get-AgentGuidanceRemoteHash `
                     -ComputerName $target.ComputerName `
@@ -1795,7 +1884,10 @@ function Sync-AgentGuidance {
 
         Write-Host ''
         $results | Format-Table ComputerName, File, Status, Backup, SHA256 -AutoSize
-        Write-Host 'Sync complete. Existing Codex and Claude sessions may retain their startup instructions; start a new session to load the new files.' -ForegroundColor Green
+        Write-Host "Sync complete for $($reachableInventory.Count) reachable target(s). Existing sessions may retain their startup instructions; start a new session to load the new files." -ForegroundColor Green
+        if ($skippedInventory.Count -gt 0) {
+            Write-Warning "Unavailable targets were skipped and not changed: $(@($skippedInventory.ComputerName) -join ', ')."
+        }
         }
         finally {
             foreach ($item in $staged) {

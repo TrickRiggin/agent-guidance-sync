@@ -1,6 +1,6 @@
 @{
     RootModule = 'AgentGuidanceSync.psm1'
-    ModuleVersion = '0.3.1'
+    ModuleVersion = '0.3.2'
     GUID = 'e20e5784-ce55-49dc-be7d-a8f0ef648664'
     Author = 'Austin Arlt'
     Copyright = '(c) 2026 Austin Arlt. Licensed under the MIT License.'

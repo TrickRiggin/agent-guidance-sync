@@ -506,6 +506,117 @@ command = "SECRET-CANARY-TWO"
         }
     }
 
+    Test-Case 'SSH probe classification skips only hard network failures' {
+        $classification = & $module {
+            $timeout = Resolve-AgentGuidanceTargetConnection -Probe ([pscustomobject]@{
+                ExitCode = 255
+                Output = @('ssh: connect to host offline-host port 22: Connection timed out')
+            })
+            $authFailure = Resolve-AgentGuidanceTargetConnection -Probe ([pscustomobject]@{
+                ExitCode = 255
+                Output = @('offline-host: Permission denied (publickey).')
+            })
+            $windows = Resolve-AgentGuidanceTargetConnection -Probe ([pscustomobject]@{
+                ExitCode = 0
+                Output = @('AGENT_GUIDANCE_PLATFORM|Windows')
+            })
+            [pscustomobject]@{
+                TimeoutAvailability = $timeout.Availability
+                TimeoutReason = $timeout.Failure
+                AuthAvailability = $authFailure.Availability
+                AuthPlatform = $authFailure.Platform
+                WindowsAvailability = $windows.Availability
+                WindowsPlatform = $windows.Platform
+            }
+        }
+
+        Assert-Equal -Expected 'Unavailable' -Actual $classification.TimeoutAvailability -Because 'a hard timeout should be skippable'
+        Assert-True -Condition $classification.TimeoutReason.Contains('Connection timed out') -Because 'the skip should retain operator evidence'
+        Assert-Equal -Expected 'Reachable' -Actual $classification.AuthAvailability -Because 'authentication failures must continue into preflight and fail closed'
+        Assert-Equal -Expected 'Unix' -Actual $classification.AuthPlatform -Because 'a failed Windows probe should retain the existing Unix fallback'
+        Assert-Equal -Expected 'Reachable' -Actual $classification.WindowsAvailability
+        Assert-Equal -Expected 'Windows' -Actual $classification.WindowsPlatform
+    }
+
+    Test-Case 'inventory retains unavailable targets while continuing reachable hosts' {
+        $probe = & $module {
+            $originalConnection = (Get-Item Function:Get-AgentGuidanceTargetConnection).ScriptBlock
+            $originalSsh = (Get-Item Function:Invoke-AgentGuidanceSsh).ScriptBlock
+            try {
+                Set-Item Function:script:Get-AgentGuidanceTargetConnection -Value {
+                    param([string] $ComputerName)
+                    if ($ComputerName -eq 'offline-host') {
+                        return [pscustomobject]@{
+                            Availability = 'Unavailable'
+                            Platform = $null
+                            Failure = 'ssh: connect to host offline-host port 22: Connection timed out'
+                        }
+                    }
+                    [pscustomobject]@{ Availability = 'Reachable'; Platform = 'Unix'; Failure = $null }
+                }
+                Set-Item Function:script:Invoke-AgentGuidanceSsh -Value {
+                    param([string] $ComputerName, [string] $RemoteCommand, [string] $InputText)
+                    $output = if ($RemoteCommand -match '\$HOME') { @('/home/tester') } else { @('ok') }
+                    [pscustomobject]@{ ExitCode = 0; Output = $output }
+                }
+
+                $inventory = @(Get-AgentGuidanceInventory -ComputerName @('offline-host', 'online-host') -File @())
+                $preview = @(Show-AgentGuidancePreview -Inventory $inventory -SourceLabel 'test-source' 6>&1) -join "`n"
+                [pscustomobject]@{
+                    Count = $inventory.Count
+                    OfflineAvailability = $inventory[0].Availability
+                    OnlineAvailability = $inventory[1].Availability
+                    OnlineHome = $inventory[1].RemoteHome
+                    Preview = $preview
+                }
+            }
+            finally {
+                Set-Item Function:script:Get-AgentGuidanceTargetConnection -Value $originalConnection
+                Set-Item Function:script:Invoke-AgentGuidanceSsh -Value $originalSsh
+            }
+        }
+
+        Assert-Equal -Expected 2 -Actual $probe.Count -Because 'one offline host must not discard the reachable inventory'
+        Assert-Equal -Expected 'Unavailable' -Actual $probe.OfflineAvailability
+        Assert-Equal -Expected 'Reachable' -Actual $probe.OnlineAvailability
+        Assert-Equal -Expected '/home/tester' -Actual $probe.OnlineHome
+        Assert-True -Condition $probe.Preview.Contains('unavailable; skipped') -Because 'the operator must see that a target was skipped'
+        Assert-True -Condition $probe.Preview.Contains('offline-host') -Because 'the skipped target should be named'
+    }
+
+    Test-Case 'authentication failures still stop inventory' {
+        $failureMessage = & $module {
+            $originalConnection = (Get-Item Function:Get-AgentGuidanceTargetConnection).ScriptBlock
+            $originalSsh = (Get-Item Function:Invoke-AgentGuidanceSsh).ScriptBlock
+            try {
+                Set-Item Function:script:Get-AgentGuidanceTargetConnection -Value {
+                    [pscustomobject]@{ Availability = 'Reachable'; Platform = 'Unix'; Failure = $null }
+                }
+                Set-Item Function:script:Invoke-AgentGuidanceSsh -Value {
+                    [pscustomobject]@{
+                        ExitCode = 255
+                        Output = @('auth-host: Permission denied (publickey).')
+                    }
+                }
+
+                try {
+                    Get-AgentGuidanceInventory -ComputerName @('auth-host') -File @() | Out-Null
+                    'NO_ERROR'
+                }
+                catch {
+                    $_.Exception.Message
+                }
+            }
+            finally {
+                Set-Item Function:script:Get-AgentGuidanceTargetConnection -Value $originalConnection
+                Set-Item Function:script:Invoke-AgentGuidanceSsh -Value $originalSsh
+            }
+        }
+
+        Assert-True -Condition ($failureMessage -match 'Permission denied') -Because 'authentication failure evidence should stop the run'
+        Assert-True -Condition ($failureMessage -ne 'NO_ERROR') -Because 'authentication failures must never be skipped'
+    }
+
     Test-Case 'successful replacement is atomic, backed up, and receipted' {
         $caseRoot = Join-Path $temporaryRoot "successful quote's case"
         $destination = Join-Path $caseRoot 'AGENTS.md'
