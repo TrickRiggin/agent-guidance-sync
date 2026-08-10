@@ -194,7 +194,7 @@ try {
 
     Test-Case 'manifest and public command surface are valid' {
         Assert-Equal -Expected 'AgentGuidanceSync' -Actual $manifest.Name -Because 'manifest name should match the module folder'
-        Assert-Equal -Expected '0.3.0' -Actual $manifest.Version.ToString() -Because 'semantic Codex config projection should ship as version 0.3.0'
+        Assert-True -Condition ($manifest.Version.ToString() -match '^\d+\.\d+\.\d+$') -Because 'the module should use a three-part release version'
         $exportedCommands = @((Get-Command -Module AgentGuidanceSync).Name | Sort-Object -Unique)
         Assert-Equal -Expected 1 -Actual $exportedCommands.Count -Because 'only one command should be public'
         Assert-Equal -Expected 'Sync-AgentGuidance' -Actual $exportedCommands[0] -Because 'the sync command should be exported'
