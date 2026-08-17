@@ -233,6 +233,7 @@ try {
         $cliText = Get-Content -LiteralPath $cliPath -Raw
         Assert-True -Condition ($cliText -match '\[switch\]\s+\$Init') -Because 'the npm CLI should forward -Init'
         Assert-True -Condition ($cliText -match '\[switch\]\s+\$Settings') -Because 'the npm CLI should forward -Settings'
+        Assert-True -Condition ($cliText -match '\[switch\]\s+\$NonInteractive') -Because 'the npm CLI should forward -NonInteractive'
     }
 
     Test-Case 'literal escaping and remote directory parsing are platform-safe' {
@@ -274,6 +275,7 @@ try {
         Assert-Equal -Expected ([IO.Path]::GetFullPath($sourcePath)) -Actual $config.Files[0].LocalPath
         Assert-Equal -Expected '.codex/AGENTS.md' -Actual $config.Files[0].RemoteRelativePath
         Assert-Equal -Expected 'AGENTS.md' -Actual $config.Files[0].Name
+        Assert-Equal -Expected 0 -Actual @($config.Files[0].AssignedTargets).Count -Because 'omitted file targets still apply to every host'
     }
 
     Test-Case 'shipped starter and multi-harness configs remain valid and narrowly scoped' {
@@ -497,7 +499,7 @@ Host github.com
 
     Test-Case 'Sync-AgentGuidance -Init writes through the public command' {
         $configPath = Join-Path $temporaryRoot 'public-init/config.json'
-        Sync-AgentGuidance -Init -ConfigPath $configPath
+        Sync-AgentGuidance -Init -NonInteractive -ConfigPath $configPath
         Assert-True -Condition (Test-Path -LiteralPath $configPath -PathType Leaf) -Because 'the public command should write the starter'
         $imported = & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $configPath
         Assert-True -Condition ($imported.Files.Count -ge 1 -and $imported.Files.Count -le 6) -Because 'Init should write only known instruction mappings'
@@ -505,8 +507,116 @@ Host github.com
             Assert-True -Condition ($file.RemoteRelativePath -match 'AGENTS\.md$|CLAUDE\.md$') -Because 'Init must not invent destinations outside the known catalog'
         }
         Assert-Throws -Pattern 'already exists' -Script {
-            Sync-AgentGuidance -Init -ConfigPath $configPath
+            Sync-AgentGuidance -Init -NonInteractive -ConfigPath $configPath
         }
+    }
+
+    Test-Case 'file mappings can be limited to named hosts' {
+        $caseRoot = Join-Path $temporaryRoot 'per-host-files'
+        $claudePath = Join-Path $caseRoot 'CLAUDE.md'
+        $grokPath = Join-Path $caseRoot 'AGENTS.md'
+        Set-TestText -Path $claudePath -Content 'claude'
+        Set-TestText -Path $grokPath -Content 'grok'
+        $configPath = Join-Path $caseRoot 'config.json'
+        $configJson = [ordered]@{
+            targets = @('maple', 'spark')
+            files = @(
+                [ordered]@{
+                    name = 'Claude CLAUDE.md'
+                    sourcePath = $claudePath
+                    destinationPath = '.claude/CLAUDE.md'
+                    targets = @('maple', 'spark')
+                }
+                [ordered]@{
+                    name = 'Grok AGENTS.md'
+                    sourcePath = $grokPath
+                    destinationPath = '.grok/AGENTS.md'
+                    targets = @('maple')
+                }
+            )
+        } | ConvertTo-Json -Depth 5
+        Set-TestText -Path $configPath -Content $configJson
+
+        $config = & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $configPath
+        $mapleFiles = @(& $module { param($files) Select-AgentGuidanceFilesForTarget -File $files -ComputerName 'maple' } $config.Files)
+        $sparkFiles = @(& $module { param($files) Select-AgentGuidanceFilesForTarget -File $files -ComputerName 'spark' } $config.Files)
+        Assert-Equal -Expected 2 -Actual $mapleFiles.Count
+        Assert-Equal -Expected 1 -Actual $sparkFiles.Count
+        Assert-Equal -Expected 'Claude CLAUDE.md' -Actual $sparkFiles[0].Name
+
+        $unknownPath = Join-Path $caseRoot 'unknown.json'
+        $unknownJson = [ordered]@{
+            targets = @('maple')
+            files = @(
+                [ordered]@{
+                    sourcePath = $claudePath
+                    destinationPath = '.claude/CLAUDE.md'
+                    targets = @('willow')
+                }
+            )
+        } | ConvertTo-Json -Depth 5
+        Set-TestText -Path $unknownPath -Content $unknownJson
+        Assert-Throws -Pattern 'not in the config targets list' -Script {
+            & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $unknownPath
+        }
+    }
+
+    Test-Case 'init plan toggles hosts and keeps per-host agent selections' {
+        $presence = & $module {
+            ConvertFrom-AgentGuidancePresenceOutput `
+                -Output @('PRESENT|.claude', 'MISSING|.grok', 'PRESENT|.config/opencode') `
+                -RelativeDirectory @('.claude', '.grok', '.config/opencode')
+        }
+        Assert-True -Condition $presence['.claude']
+        Assert-True -Condition (-not $presence['.grok'])
+        Assert-True -Condition $presence['.config/opencode']
+
+        $plan = @(
+            [pscustomobject]@{
+                ComputerName = 'maple'
+                Availability = 'Reachable'
+                Failure = $null
+                Agents = @(
+                    [pscustomobject]@{ Name = 'Claude CLAUDE.md'; SourcePath = '~/.claude/CLAUDE.md'; DestinationPath = '.claude/CLAUDE.md'; Selected = $true }
+                    [pscustomobject]@{ Name = 'Grok AGENTS.md'; SourcePath = '~/.grok/AGENTS.md'; DestinationPath = '.grok/AGENTS.md'; Selected = $true }
+                    [pscustomobject]@{ Name = 'OpenCode AGENTS.md'; SourcePath = '~/.config/opencode/AGENTS.md'; DestinationPath = '.config/opencode/AGENTS.md'; Selected = $true }
+                )
+            }
+            [pscustomobject]@{
+                ComputerName = 'spark'
+                Availability = 'Reachable'
+                Failure = $null
+                Agents = @(
+                    [pscustomobject]@{ Name = 'Claude CLAUDE.md'; SourcePath = '~/.claude/CLAUDE.md'; DestinationPath = '.claude/CLAUDE.md'; Selected = $true }
+                    [pscustomobject]@{ Name = 'Grok AGENTS.md'; SourcePath = '~/.grok/AGENTS.md'; DestinationPath = '.grok/AGENTS.md'; Selected = $true }
+                    [pscustomobject]@{ Name = 'OpenCode AGENTS.md'; SourcePath = '~/.config/opencode/AGENTS.md'; DestinationPath = '.config/opencode/AGENTS.md'; Selected = $true }
+                )
+            }
+        )
+
+        $rows = @(& $module { param($hosts) Get-AgentGuidanceInitPlanRows -HostPlan $hosts } $plan)
+        Assert-Equal -Expected 'Confirm' -Actual $rows[-1].Kind -Because 'the last row should be an explicit confirm action'
+        $summary = & $module { param($hosts) Get-AgentGuidanceInitPlanSummary -HostPlan $hosts } $plan
+        Assert-True -Condition ($summary -match '2 hosts selected') -Because 'the confirm footer should count selected hosts'
+        $sparkHost = $rows | Where-Object { $_.Kind -eq 'Host' -and $_.Host.ComputerName -eq 'spark' } | Select-Object -First 1
+        $sparkGrok = $rows | Where-Object { $_.Kind -eq 'Agent' -and $_.Host.ComputerName -eq 'spark' -and $_.Agent.Name -eq 'Grok AGENTS.md' } | Select-Object -First 1
+        $sparkOpenCode = $rows | Where-Object { $_.Kind -eq 'Agent' -and $_.Host.ComputerName -eq 'spark' -and $_.Agent.Name -eq 'OpenCode AGENTS.md' } | Select-Object -First 1
+        & $module { param($row) Invoke-AgentGuidanceInitPlanToggle -Row $row } $sparkGrok
+        & $module { param($row) Invoke-AgentGuidanceInitPlanToggle -Row $row } $sparkOpenCode
+        Assert-True -Condition (-not $sparkGrok.Agent.Selected)
+        Assert-True -Condition (-not $sparkOpenCode.Agent.Selected)
+        Assert-Equal -Expected '-' -Actual (& $module { param($hostItem) Get-AgentGuidanceHostSelectionMark -HostItem $hostItem } $sparkHost.Host)
+
+        $document = & $module { param($hosts) ConvertTo-AgentGuidanceConfigDocumentFromPlan -SourceLabel 'OAK' -HostPlan $hosts } $plan
+        $grokFile = @($document.files | Where-Object { $_.name -eq 'Grok AGENTS.md' })[0]
+        $openCodeFile = @($document.files | Where-Object { $_.name -eq 'OpenCode AGENTS.md' })[0]
+        $claudeFile = @($document.files | Where-Object { $_.name -eq 'Claude CLAUDE.md' })[0]
+        Assert-Equal -Expected 'maple' -Actual ($grokFile.targets -join ',')
+        Assert-Equal -Expected 'maple' -Actual ($openCodeFile.targets -join ',')
+        Assert-Equal -Expected 'maple,spark' -Actual ($claudeFile.targets -join ',')
+
+        & $module { param($row) Invoke-AgentGuidanceInitPlanToggle -Row $row } $sparkHost
+        Assert-True -Condition $sparkGrok.Agent.Selected -Because 'selecting a host should re-check every agent on that host'
     }
 
     Test-Case 'exact-copy mappings cannot bypass sensitive-state boundaries' {

@@ -34,7 +34,9 @@ param(
 
     [switch] $Settings,
 
-    [switch] $Init
+    [switch] $Init,
+
+    [switch] $NonInteractive
 )
 
 Set-StrictMode -Version Latest
