@@ -8,7 +8,7 @@
 
 - Preview is the default. Remote writes require the explicit `-apply` switch. Parameter names are case-insensitive; `-Apply` is the same switch.
 - Default preview and `-apply` write instruction files only. A `codexConfig` block is inert until `-settings` is passed. `-settings` previews or applies the semantic Codex projection and must not copy instruction files in the same run.
-- `-init` may write only a local starter config. It never connects or changes a remote host, and it must not overwrite an existing config.
+- `-init` may write only a local starter config and must not overwrite an existing config. The interactive wizard may make read-only SSH probes to see which agent directories already exist; it never writes remotely. Probe failures skip that alias instead of failing the wizard. `-init -NonInteractive` stays local-only.
 - Destination paths remain relative to the remote user's home directory. Reject absolute paths, drive-qualified paths, empty segments, and `..` traversal.
 - Stage every payload before replacing any destination.
 - Fence each replacement with the hash observed during preview. A changed destination must fail closed.

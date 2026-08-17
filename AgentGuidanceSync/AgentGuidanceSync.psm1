@@ -423,13 +423,7 @@ function Initialize-AgentGuidanceConfig {
             }
         )
     }
-    $json = ($document | ConvertTo-Json -Depth 5) + [Environment]::NewLine
-
-    $configDirectory = [IO.Path]::GetDirectoryName($resolvedConfigPath)
-    if (-not [string]::IsNullOrWhiteSpace($configDirectory)) {
-        New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
-    }
-    [IO.File]::WriteAllText($resolvedConfigPath, $json, [Text.UTF8Encoding]::new($false))
+    Write-AgentGuidanceConfigFile -ConfigPath $resolvedConfigPath -Document $document
 
     $commandName = Get-AgentGuidanceOperatorCommand
     $usedFallback = @($selectedFiles | Where-Object { $_.Fallback }).Count -gt 0
@@ -469,6 +463,589 @@ function Initialize-AgentGuidanceConfig {
         Files = $selectedFiles
         UsedFallback = $usedFallback
         SshAliases = $sshAliases
+    }
+}
+
+function Write-AgentGuidanceConfigFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ConfigPath,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Document
+    )
+
+    $json = ($Document | ConvertTo-Json -Depth 6) + [Environment]::NewLine
+    $configDirectory = [IO.Path]::GetDirectoryName($ConfigPath)
+    if (-not [string]::IsNullOrWhiteSpace($configDirectory)) {
+        New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+    }
+    [IO.File]::WriteAllText($ConfigPath, $json, [Text.UTF8Encoding]::new($false))
+}
+
+function Get-AgentGuidanceKnownFileDirectory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $DestinationPath
+    )
+
+    $normalized = $DestinationPath.Replace('\', '/')
+    $separatorIndex = $normalized.LastIndexOf('/')
+    if ($separatorIndex -le 0) {
+        throw "The destination path has no parent directory: $DestinationPath"
+    }
+
+    $normalized.Substring(0, $separatorIndex)
+}
+
+function New-AgentGuidanceUnixPresenceCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $RelativeDirectory
+    )
+
+    $directoryLiterals = @($RelativeDirectory | ForEach-Object { ConvertTo-AgentGuidanceShellLiteral -Value $_ })
+    $joined = $directoryLiterals -join ' '
+    'set -eu; for relative_directory in ' + $joined + '; do if [ -e "$HOME/$relative_directory" ]; then printf "PRESENT|%s\n" "$relative_directory"; else printf "MISSING|%s\n" "$relative_directory"; fi; done'
+}
+
+function New-AgentGuidanceWindowsPresenceScript {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $RelativeDirectory
+    )
+
+    $directoryLiterals = @($RelativeDirectory | ForEach-Object { ConvertTo-AgentGuidancePowerShellLiteral -Value $_.Replace('/', '\') })
+    $joined = $directoryLiterals -join ', '
+    @"
+`$homePath = [Environment]::GetFolderPath('UserProfile')
+if ([string]::IsNullOrWhiteSpace(`$homePath)) { throw 'The Windows user profile path is empty.' }
+foreach (`$relativeDirectory in @($joined)) {
+    `$path = [IO.Path]::Combine(`$homePath, `$relativeDirectory)
+    if ([IO.Directory]::Exists(`$path) -or [IO.File]::Exists(`$path)) {
+        [Console]::Out.WriteLine('PRESENT|' + `$relativeDirectory.Replace('\', '/'))
+    }
+    else {
+        [Console]::Out.WriteLine('MISSING|' + `$relativeDirectory.Replace('\', '/'))
+    }
+}
+"@
+}
+
+function ConvertFrom-AgentGuidancePresenceOutput {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [string[]] $Output = @(),
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $RelativeDirectory
+    )
+
+    $presence = [ordered]@{}
+    foreach ($directory in $RelativeDirectory) {
+        $presence[$directory] = $false
+    }
+    foreach ($line in @($Output)) {
+        if ($line -match '^(PRESENT|MISSING)\|(.*)$') {
+            $directory = $Matches[2].Replace('\', '/')
+            if ($presence.Keys -contains $directory) {
+                $presence[$directory] = ($Matches[1] -eq 'PRESENT')
+            }
+        }
+    }
+
+    $presence
+}
+
+function Get-AgentGuidanceRemotePresenceMap {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ComputerName,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Unix', 'Windows')]
+        [string] $Platform,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $RelativeDirectory
+    )
+
+    if ($RelativeDirectory.Count -eq 0) {
+        return [ordered]@{}
+    }
+
+    if ($Platform -eq 'Windows') {
+        $script = New-AgentGuidanceWindowsPresenceScript -RelativeDirectory $RelativeDirectory
+        $result = Invoke-AgentGuidanceWindowsPowerShell -ComputerName $ComputerName -Script $script
+        Assert-AgentGuidanceSuccess -Result $result -Context "Checking guidance directories on $ComputerName"
+        return ConvertFrom-AgentGuidancePresenceOutput -Output $result.Output -RelativeDirectory $RelativeDirectory
+    }
+
+    $command = New-AgentGuidanceUnixPresenceCommand -RelativeDirectory $RelativeDirectory
+    $result = Invoke-AgentGuidanceSsh -ComputerName $ComputerName -RemoteCommand $command
+    Assert-AgentGuidanceSuccess -Result $result -Context "Checking guidance directories on $ComputerName"
+    ConvertFrom-AgentGuidancePresenceOutput -Output $result.Output -RelativeDirectory $RelativeDirectory
+}
+
+function Get-AgentGuidanceInitHostDiscovery {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ComputerName,
+
+        [AllowEmptyCollection()]
+        [pscustomobject[]] $LocalFile = @()
+    )
+
+    $directories = @(
+        $LocalFile |
+            ForEach-Object { Get-AgentGuidanceKnownFileDirectory -DestinationPath $_.DestinationPath } |
+            Sort-Object -Unique
+    )
+
+    try {
+        $connection = Get-AgentGuidanceTargetConnection -ComputerName $ComputerName
+        if ($connection.Availability -eq 'Unavailable') {
+            return [pscustomobject]@{
+                ComputerName = $ComputerName
+                Availability = 'Unavailable'
+                Failure = $connection.Failure
+                Agents = @()
+            }
+        }
+
+        $presence = Get-AgentGuidanceRemotePresenceMap `
+            -ComputerName $ComputerName `
+            -Platform $connection.Platform `
+            -RelativeDirectory $directories
+        $agents = @(
+            foreach ($file in $LocalFile) {
+                $directory = Get-AgentGuidanceKnownFileDirectory -DestinationPath $file.DestinationPath
+                if (-not $presence[$directory]) {
+                    continue
+                }
+                [pscustomobject]@{
+                    Name = $file.Name
+                    SourcePath = $file.SourcePath
+                    DestinationPath = $file.DestinationPath
+                    Selected = $true
+                }
+            }
+        )
+
+        [pscustomobject]@{
+            ComputerName = $ComputerName
+            Availability = 'Reachable'
+            Failure = $null
+            Agents = $agents
+        }
+    }
+    catch {
+        [pscustomobject]@{
+            ComputerName = $ComputerName
+            Availability = 'Unavailable'
+            Failure = $_.Exception.Message
+            Agents = @()
+        }
+    }
+}
+
+function ConvertTo-AgentGuidanceConfigDocumentFromPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SourceLabel,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [pscustomobject[]] $HostPlan
+    )
+
+    $selectedHosts = [Collections.Generic.List[string]]::new()
+    $filesByName = [ordered]@{}
+    foreach ($hostItem in $HostPlan) {
+        $selectedAgents = @($hostItem.Agents | Where-Object { $_.Selected })
+        if ($selectedAgents.Count -eq 0) {
+            continue
+        }
+        $selectedHosts.Add([string] $hostItem.ComputerName)
+        foreach ($agent in $selectedAgents) {
+            if (-not $filesByName.Contains($agent.Name)) {
+                $filesByName[$agent.Name] = [ordered]@{
+                    name = $agent.Name
+                    sourcePath = $agent.SourcePath
+                    destinationPath = $agent.DestinationPath
+                    targets = [Collections.Generic.List[string]]::new()
+                }
+            }
+            $filesByName[$agent.Name].targets.Add([string] $hostItem.ComputerName)
+        }
+    }
+
+    if ($selectedHosts.Count -eq 0) {
+        throw 'Select at least one agent on one host before writing a config.'
+    }
+
+    [ordered]@{
+        sourceLabel = $SourceLabel
+        targets = @($selectedHosts)
+        files = @(
+            foreach ($file in $filesByName.Values) {
+                [ordered]@{
+                    name = $file.name
+                    sourcePath = $file.sourcePath
+                    destinationPath = $file.destinationPath
+                    targets = @($file.targets)
+                }
+            }
+        )
+    }
+}
+
+function Invoke-AgentGuidanceInitPlanToggle {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Row
+    )
+
+    if ($Row.Kind -eq 'Confirm' -or $null -eq $Row.Kind) {
+        return
+    }
+
+    if ($Row.Kind -eq 'Host') {
+        if ($Row.Host.Availability -ne 'Reachable' -or @($Row.Host.Agents).Count -eq 0) {
+            return
+        }
+        $allSelected = @($Row.Host.Agents | Where-Object { -not $_.Selected }).Count -eq 0
+        foreach ($agent in $Row.Host.Agents) {
+            $agent.Selected = -not $allSelected
+        }
+        return
+    }
+
+    if ($null -eq $Row.Agent) {
+        return
+    }
+
+    $Row.Agent.Selected = -not [bool] $Row.Agent.Selected
+}
+
+function Get-AgentGuidanceInitPlanRows {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [pscustomobject[]] $HostPlan
+    )
+
+    @(
+        foreach ($hostItem in $HostPlan) {
+            [pscustomobject]@{
+                Kind = 'Host'
+                Host = $hostItem
+                Agent = $null
+            }
+            foreach ($agent in @($hostItem.Agents)) {
+                [pscustomobject]@{
+                    Kind = 'Agent'
+                    Host = $hostItem
+                    Agent = $agent
+                }
+            }
+        }
+        [pscustomobject]@{
+            Kind = 'Confirm'
+            Host = $null
+            Agent = $null
+        }
+    )
+}
+
+function Get-AgentGuidanceInitPlanSummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [pscustomobject[]] $HostPlan
+    )
+
+    $selectedHosts = @($HostPlan | Where-Object { @($_.Agents | Where-Object { $_.Selected }).Count -gt 0 })
+    $selectedAgents = 0
+    foreach ($hostItem in $selectedHosts) {
+        $selectedAgents += @($hostItem.Agents | Where-Object { $_.Selected }).Count
+    }
+
+    $hostPhrase = ConvertTo-AgentGuidanceCountPhrase -Count $selectedHosts.Count -Singular 'host' -Plural 'hosts'
+    $agentPhrase = ConvertTo-AgentGuidanceCountPhrase -Count $selectedAgents -Singular 'agent mapping' -Plural 'agent mappings'
+    "$hostPhrase selected · $agentPhrase"
+}
+
+function Complete-AgentGuidanceInitWizardWrite {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SourceLabel,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [pscustomobject[]] $HostPlan,
+
+        [Parameter(Mandatory)]
+        [string] $ConfigPath,
+
+        [AllowEmptyCollection()]
+        [string[]] $SshAlias = @()
+    )
+
+    $document = ConvertTo-AgentGuidanceConfigDocumentFromPlan -SourceLabel $SourceLabel -HostPlan $HostPlan
+    Write-AgentGuidanceConfigFile -ConfigPath $ConfigPath -Document $document
+    $imported = Import-AgentGuidanceConfig -ConfigPath $ConfigPath
+    $commandName = Get-AgentGuidanceOperatorCommand
+    Write-Host ''
+    Write-Host "Wrote starter config: $ConfigPath" -ForegroundColor Green
+    Write-Host "Source label: $SourceLabel"
+    foreach ($file in $imported.Files) {
+        $assigned = @($file.AssignedTargets) -join ', '
+        Write-Host "  $($file.Name) -> $assigned" -ForegroundColor Cyan
+    }
+    Write-Host ''
+    Write-Host "Next: $commandName"
+    Write-Host "Apply later with $commandName -apply"
+
+    [pscustomobject]@{
+        ConfigPath = $ConfigPath
+        SourceLabel = $SourceLabel
+        Files = @($imported.Files)
+        UsedFallback = $false
+        SshAliases = @($SshAlias)
+    }
+}
+
+function Get-AgentGuidanceHostSelectionMark {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $HostItem
+    )
+
+    $agents = @($HostItem.Agents)
+    if ($agents.Count -eq 0) {
+        return ' '
+    }
+    $selectedCount = @($agents | Where-Object { $_.Selected }).Count
+    if ($selectedCount -eq 0) {
+        return ' '
+    }
+    if ($selectedCount -eq $agents.Count) {
+        return 'x'
+    }
+    '-'
+}
+
+function Test-AgentGuidanceInteractiveConsole {
+    [CmdletBinding()]
+    param()
+
+    -not [Console]::IsInputRedirected -and
+        -not [Console]::IsOutputRedirected -and
+        [Environment]::UserInteractive -and
+        $Host.Name -eq 'ConsoleHost'
+}
+
+function Invoke-AgentGuidanceInitWizard {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ConfigPath,
+
+        [string] $ProfileRoot = ([Environment]::GetFolderPath('UserProfile')),
+
+        [string] $SshConfigPath
+    )
+
+    $currentDirectory = (Get-Location).ProviderPath
+    $resolvedConfigPath = Resolve-AgentGuidanceSourcePath -Path $ConfigPath -BaseDirectory $currentDirectory
+    if (Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf) {
+        throw "A config already exists at $resolvedConfigPath. Edit that file, or pass a different -ConfigPath."
+    }
+
+    $localFiles = @(Select-AgentGuidanceStarterFiles -ProfileRoot $ProfileRoot | Where-Object { -not $_.Fallback })
+    if ($localFiles.Count -eq 0) {
+        throw 'No local guidance files were found. Create at least one native instruction file, then rerun -init.'
+    }
+
+    $aliases = @(
+        if ($PSBoundParameters.ContainsKey('SshConfigPath')) {
+            Get-AgentGuidanceSshConfigAliases -SshConfigPath $SshConfigPath
+        }
+        else {
+            Get-AgentGuidanceSshConfigAliases
+        }
+    )
+    if ($aliases.Count -eq 0) {
+        throw 'No concrete SSH Host aliases were found in ~/.ssh/config. Add aliases there, then rerun -init.'
+    }
+
+    Write-Host "Local instruction files: $($localFiles.Name -join ', ')" -ForegroundColor Cyan
+    $hostPlan = @(
+        foreach ($alias in $aliases) {
+            Write-Host "Checking $alias..." -ForegroundColor DarkGray
+            Get-AgentGuidanceInitHostDiscovery -ComputerName $alias -LocalFile $localFiles
+        }
+    )
+
+    $reachableWithAgents = @($hostPlan | Where-Object { $_.Availability -eq 'Reachable' -and @($_.Agents).Count -gt 0 })
+    if ($reachableWithAgents.Count -eq 0) {
+        $skipped = @($hostPlan | Where-Object { $_.Availability -eq 'Unavailable' -or @($_.Agents).Count -eq 0 })
+        $details = @($skipped | ForEach-Object {
+            if ($_.Availability -eq 'Unavailable') {
+                "$($_.ComputerName) (unavailable)"
+            }
+            else {
+                "$($_.ComputerName) (no matching agent directories)"
+            }
+        }) -join ', '
+        throw "No reachable hosts have directories for your local instruction files. $details"
+    }
+
+    $sourceLabel = [Environment]::MachineName
+    if ([string]::IsNullOrWhiteSpace($sourceLabel) -or $sourceLabel -match '[\r\n|]') {
+        $sourceLabel = 'primary-workstation'
+    }
+
+    $rows = @(Get-AgentGuidanceInitPlanRows -HostPlan $hostPlan)
+    $cursor = 0
+    for ($index = 0; $index -lt $rows.Count; $index++) {
+        if ($rows[$index].Kind -eq 'Host' -and $rows[$index].Host.Availability -eq 'Reachable' -and @($rows[$index].Host.Agents).Count -gt 0) {
+            $cursor = $index
+            break
+        }
+    }
+
+    $originalCursorVisible = $true
+    try {
+        $originalCursorVisible = [Console]::CursorVisible
+        [Console]::CursorVisible = $false
+    }
+    catch {
+        $originalCursorVisible = $true
+    }
+
+    try {
+        while ($true) {
+            Clear-Host
+            Write-Host 'Pick hosts and agents to sync.' -ForegroundColor Cyan
+            Write-Host 'Hosts are yellow. Agents are cyan. Only directories that already exist on a host are listed.'
+            Write-Host 'Up/Down move  Space toggles  Enter on Confirm writes  q cancels'
+            Write-Host ''
+
+            for ($index = 0; $index -lt $rows.Count; $index++) {
+                $row = $rows[$index]
+                $marker = if ($index -eq $cursor) { '>' } else { ' ' }
+                if ($row.Kind -eq 'Host') {
+                    $mark = Get-AgentGuidanceHostSelectionMark -HostItem $row.Host
+                    $label = "$marker [$mark] $($row.Host.ComputerName)"
+                    if ($row.Host.Availability -eq 'Unavailable') {
+                        Write-Host "$label  skipped: $($row.Host.Failure)" -ForegroundColor DarkYellow
+                    }
+                    elseif (@($row.Host.Agents).Count -eq 0) {
+                        Write-Host "$label  no matching agent directories" -ForegroundColor DarkYellow
+                    }
+                    else {
+                        Write-Host $label -ForegroundColor Yellow
+                    }
+                    continue
+                }
+
+                if ($row.Kind -eq 'Confirm') {
+                    Write-Host ''
+                    Write-Host "  $(Get-AgentGuidanceInitPlanSummary -HostPlan $hostPlan)" -ForegroundColor DarkGray
+                    Write-Host "$marker [ Confirm and write ]" -ForegroundColor Green
+                    continue
+                }
+
+                $agentMark = if ($row.Agent.Selected) { 'x' } else { ' ' }
+                Write-Host "$marker     [$agentMark] $($row.Agent.Name)" -ForegroundColor Cyan
+            }
+
+            $key = [Console]::ReadKey($true)
+            $confirmSelected = ($rows[$cursor].Kind -eq 'Confirm')
+            switch ($key.Key) {
+                'UpArrow' {
+                    if ($cursor -gt 0) {
+                        $cursor--
+                    }
+                }
+                'DownArrow' {
+                    if ($cursor -lt ($rows.Count - 1)) {
+                        $cursor++
+                    }
+                }
+                'Spacebar' {
+                    if ($confirmSelected) {
+                        try {
+                            return Complete-AgentGuidanceInitWizardWrite `
+                                -SourceLabel $sourceLabel `
+                                -HostPlan $hostPlan `
+                                -ConfigPath $resolvedConfigPath `
+                                -SshAlias $aliases
+                        }
+                        catch {
+                            Write-Host ''
+                            Write-Host $_.Exception.Message -ForegroundColor Red
+                            Write-Host 'Press any key to keep editing.'
+                            $null = [Console]::ReadKey($true)
+                        }
+                    }
+                    else {
+                        Invoke-AgentGuidanceInitPlanToggle -Row $rows[$cursor]
+                    }
+                }
+                'Enter' {
+                    if (-not $confirmSelected) {
+                        $cursor = $rows.Count - 1
+                        continue
+                    }
+                    try {
+                        return Complete-AgentGuidanceInitWizardWrite `
+                            -SourceLabel $sourceLabel `
+                            -HostPlan $hostPlan `
+                            -ConfigPath $resolvedConfigPath `
+                            -SshAlias $aliases
+                    }
+                    catch {
+                        Write-Host ''
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Write-Host 'Press any key to keep editing.'
+                        $null = [Console]::ReadKey($true)
+                    }
+                }
+                'Escape' {
+                    throw 'Init wizard cancelled. No config was written.'
+                }
+                'Q' {
+                    throw 'Init wizard cancelled. No config was written.'
+                }
+            }
+        }
+    }
+    finally {
+        try {
+            [Console]::CursorVisible = $originalCursorVisible
+        }
+        catch {
+        }
     }
 }
 
@@ -874,10 +1451,38 @@ function Import-AgentGuidanceConfig {
             throw "Duplicate destination path in config: $remoteRelativePath"
         }
 
+        $assignedTargets = @()
+        $fileTargetsProperty = $rawFile.PSObject.Properties['targets']
+        if ($null -ne $fileTargetsProperty -and $null -ne $fileTargetsProperty.Value) {
+            $fileTargetSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($rawFileTarget in @($fileTargetsProperty.Value)) {
+                $fileTarget = Assert-AgentGuidanceComputerName -ComputerName ([string] $rawFileTarget)
+                if (-not $fileTargetSet.Add($fileTarget)) {
+                    throw "Duplicate SSH target in file mapping '${name}': $fileTarget"
+                }
+                $assignedTargets += $fileTarget
+            }
+            if ($assignedTargets.Count -eq 0) {
+                throw "File mapping '${name}' has an empty targets list. Omit targets to apply it to every host, or name at least one."
+            }
+        }
+
         $files += [pscustomobject]@{
             Name = $name
             LocalPath = $localPath
             RemoteRelativePath = $remoteRelativePath
+            AssignedTargets = $assignedTargets
+        }
+    }
+
+    foreach ($file in $files) {
+        if (@($file.AssignedTargets).Count -eq 0 -or $targets.Count -eq 0) {
+            continue
+        }
+        foreach ($assignedTarget in $file.AssignedTargets) {
+            if ($assignedTarget -notin $targets) {
+                throw "File mapping '$($file.Name)' lists target '$assignedTarget', which is not in the config targets list."
+            }
         }
     }
 
@@ -1591,6 +2196,38 @@ function Set-AgentGuidanceWindowsStage {
     }
 }
 
+function Select-AgentGuidanceFilesForTarget {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [pscustomobject[]] $File = @(),
+
+        [Parameter(Mandatory)]
+        [string] $ComputerName
+    )
+
+    @(
+        foreach ($item in @($File)) {
+            $assignedProperty = $item.PSObject.Properties['AssignedTargets']
+            $assignedTargets = @()
+            if ($null -ne $assignedProperty -and $null -ne $assignedProperty.Value) {
+                $assignedTargets = @($assignedProperty.Value)
+            }
+            if ($assignedTargets.Count -eq 0) {
+                $item
+                continue
+            }
+            $assignedSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($assignedTarget in $assignedTargets) {
+                [void] $assignedSet.Add([string] $assignedTarget)
+            }
+            if ($assignedSet.Contains($ComputerName)) {
+                $item
+            }
+        }
+    )
+}
+
 function Get-AgentGuidanceInventory {
     [CmdletBinding()]
     param(
@@ -1605,6 +2242,7 @@ function Get-AgentGuidanceInventory {
     $inventory = @()
     foreach ($computer in $ComputerName) {
         Write-Host "Checking $computer..." -ForegroundColor Cyan
+        $filesForTarget = @(Select-AgentGuidanceFilesForTarget -File $File -ComputerName $computer)
 
         $connection = Get-AgentGuidanceTargetConnection -ComputerName $computer
         if ($connection.Availability -eq 'Unavailable') {
@@ -1653,7 +2291,7 @@ if ([string]::IsNullOrWhiteSpace($homePath)) {
         }
 
         $remoteFiles = @()
-        foreach ($item in $File) {
+        foreach ($item in $filesForTarget) {
             $remotePath = if ($platform -eq 'Windows') {
                 $remoteHome.TrimEnd('\') + '\' + $item.RemoteRelativePath.Replace('/', '\')
             }
@@ -2089,7 +2727,9 @@ function Sync-AgentGuidance {
     SHA-256 readback. Targets with a hard SSH reachability failure during the
     initial probe are reported and skipped. Authentication, host-key, preflight,
     staging, commit, and verification failures still stop the run. -init writes
-    a local starter config and does not connect to any host.
+    a local starter config. In an interactive console it probes SSH aliases
+    read-only and lets you pick hosts and agents. -NonInteractive writes the
+    local starter without prompting.
 
     .EXAMPLE
     ag-sync -init
@@ -2127,10 +2767,23 @@ function Sync-AgentGuidance {
         [switch] $Settings,
 
         [Parameter(Mandatory, ParameterSetName = 'Init')]
-        [switch] $Init
+        [switch] $Init,
+
+        [Parameter(ParameterSetName = 'Init')]
+        [switch] $NonInteractive
     )
 
     if ($Init) {
+        if (-not $NonInteractive -and (Test-AgentGuidanceInteractiveConsole)) {
+            foreach ($toolName in @('ssh', 'scp', 'git')) {
+                if (-not (Get-Command $toolName -ErrorAction SilentlyContinue)) {
+                    throw "$toolName is required but is not on PATH. Install OpenSSH and Git, then open a new terminal."
+                }
+            }
+            $null = Invoke-AgentGuidanceInitWizard -ConfigPath $ConfigPath
+            return
+        }
+
         $null = Initialize-AgentGuidanceConfig -ConfigPath $ConfigPath
         return
     }
@@ -2150,11 +2803,28 @@ function Sync-AgentGuidance {
             -UseOverride:$PSBoundParameters.ContainsKey('ComputerName')
     )
 
-    $files = @(
+    $configuredFiles = @(
         if ($scope.IncludeFiles) {
             $config.Files
         }
     )
+    $files = @(
+        foreach ($item in $configuredFiles) {
+            $assignedToSelectedTarget = $false
+            foreach ($targetName in $targets) {
+                if (@(Select-AgentGuidanceFilesForTarget -File @($item) -ComputerName $targetName).Count -gt 0) {
+                    $assignedToSelectedTarget = $true
+                    break
+                }
+            }
+            if ($assignedToSelectedTarget) {
+                $item
+            }
+        }
+    )
+    if ($scope.IncludeFiles -and $configuredFiles.Count -gt 0 -and $files.Count -eq 0) {
+        throw "None of the selected hosts are assigned any instruction files. Edit the file mapping targets in $($config.ConfigPath) or pass a different -ComputerName."
+    }
 
     foreach ($item in $files) {
         if (-not (Test-Path -LiteralPath $item.LocalPath -PathType Leaf)) {

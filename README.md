@@ -11,7 +11,7 @@ npm install --global agent-guidance-sync
 ag-sync -init
 ```
 
-`-init` writes `~/.config/agent-guidance-sync/config.json`, includes any usual local guidance files it can see, and leaves `host-one` / `host-two` as placeholders. Replace those with SSH aliases from `~/.ssh/config`, then:
+`-init` opens a checklist of SSH aliases from `~/.ssh/config`. Hosts are yellow; agents are cyan. Selecting a host checks every agent directory that already exists there. You can uncheck an agent so a file is not created on a machine that does not have that harness. Move to **Confirm and write** at the bottom to save. Then:
 
 ```powershell
 ag-sync            # preview
@@ -92,7 +92,7 @@ The installer refuses to replace an existing `AgentGuidanceSync` installation un
 
 ## Configure
 
-The usual path is `ag-sync -init`. That creates the default private config directory and writes a starter `config.json` without overwriting an existing file.
+The usual path is `ag-sync -init`. In a terminal that is an interactive checklist: it probes each SSH alias read-only, lists only agent directories that already exist on that host, and writes per-host file assignments. It will not overwrite an existing config. Use `ag-sync -init -NonInteractive` to write the local starter without prompting.
 
 If you prefer to copy a preset by hand:
 
