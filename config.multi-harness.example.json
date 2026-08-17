@@ -16,6 +16,11 @@
       "destinationPath": ".claude/CLAUDE.md"
     },
     {
+      "name": "Grok AGENTS.md",
+      "sourcePath": "~/.grok/AGENTS.md",
+      "destinationPath": ".grok/AGENTS.md"
+    },
+    {
       "name": "Pi AGENTS.md",
       "sourcePath": "~/.pi/agent/AGENTS.md",
       "destinationPath": ".pi/agent/AGENTS.md"

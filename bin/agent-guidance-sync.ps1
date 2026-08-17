@@ -6,13 +6,22 @@
 Previews or applies agent guidance synchronization from the npm-installed CLI.
 
 .EXAMPLE
-agent-guidance-sync
+ag-sync -init
 
 .EXAMPLE
-agent-guidance-sync -Apply
+ag-sync
 
 .EXAMPLE
-agent-guidance-sync -ComputerName host-one -Apply
+ag-sync -apply
+
+.EXAMPLE
+ag-sync -settings
+
+.EXAMPLE
+ag-sync -settings -apply
+
+.EXAMPLE
+ag-sync -ComputerName host-one -apply
 #>
 
 [CmdletBinding()]
@@ -21,7 +30,11 @@ param(
 
     [string] $ConfigPath,
 
-    [switch] $Apply
+    [switch] $Apply,
+
+    [switch] $Settings,
+
+    [switch] $Init
 )
 
 Set-StrictMode -Version Latest

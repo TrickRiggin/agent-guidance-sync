@@ -6,7 +6,9 @@
 
 ## Safety invariants
 
-- Preview is the default. Remote writes require the explicit `-Apply` switch.
+- Preview is the default. Remote writes require the explicit `-apply` switch. Parameter names are case-insensitive; `-Apply` is the same switch.
+- Default preview and `-apply` write instruction files only. A `codexConfig` block is inert until `-settings` is passed. `-settings` previews or applies the semantic Codex projection and must not copy instruction files in the same run.
+- `-init` may write only a local starter config. It never connects or changes a remote host, and it must not overwrite an existing config.
 - Destination paths remain relative to the remote user's home directory. Reject absolute paths, drive-qualified paths, empty segments, and `..` traversal.
 - Stage every payload before replacing any destination.
 - Fence each replacement with the hash observed during preview. A changed destination must fail closed.
@@ -20,7 +22,7 @@
 ## Development
 
 - Use PowerShell 7.2 or newer.
-- Keep `Sync-AgentGuidance` as the only public command unless a new public surface has a clear operator need.
+- Keep `Sync-AgentGuidance` as the only public command unless a new public surface has a clear operator need. `ag-sync` is an allowed alias of that command, not a second engine.
 - Verify harness paths and precedence against current first-party documentation before changing compatibility claims or examples.
 - Run `pwsh -NoProfile -File tests/Test-AgentGuidanceSync.ps1` after behavior changes.
 - Tests must cover configuration validation and transaction failure paths, not only the happy path.

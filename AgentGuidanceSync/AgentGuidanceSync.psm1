@@ -34,6 +34,44 @@ $script:AgentGuidanceCodexRemovalKeys = @(
     'features.terminal_resize_reflow',
     'tui.tui.transcript_syntax_highlight'
 )
+$script:AgentGuidanceKnownFiles = @(
+    [pscustomobject]@{
+        Name = 'Codex AGENTS.md'
+        SourcePath = '~/.codex/AGENTS.md'
+        DestinationPath = '.codex/AGENTS.md'
+        Starter = $true
+    }
+    [pscustomobject]@{
+        Name = 'Claude CLAUDE.md'
+        SourcePath = '~/.claude/CLAUDE.md'
+        DestinationPath = '.claude/CLAUDE.md'
+        Starter = $true
+    }
+    [pscustomobject]@{
+        Name = 'Grok AGENTS.md'
+        SourcePath = '~/.grok/AGENTS.md'
+        DestinationPath = '.grok/AGENTS.md'
+        Starter = $false
+    }
+    [pscustomobject]@{
+        Name = 'Pi AGENTS.md'
+        SourcePath = '~/.pi/agent/AGENTS.md'
+        DestinationPath = '.pi/agent/AGENTS.md'
+        Starter = $false
+    }
+    [pscustomobject]@{
+        Name = 'oh-my-pi AGENTS.md'
+        SourcePath = '~/.omp/agent/AGENTS.md'
+        DestinationPath = '.omp/agent/AGENTS.md'
+        Starter = $false
+    }
+    [pscustomobject]@{
+        Name = 'OpenCode AGENTS.md'
+        SourcePath = '~/.config/opencode/AGENTS.md'
+        DestinationPath = '.config/opencode/AGENTS.md'
+        Starter = $false
+    }
+)
 
 function Invoke-AgentGuidanceNative {
     [CmdletBinding()]
@@ -198,6 +236,379 @@ function Get-AgentGuidanceDefaultConfigPath {
     }
 
     Join-Path $profileRoot '.config/agent-guidance-sync/config.json'
+}
+
+function Get-AgentGuidanceOperatorCommand {
+    [CmdletBinding()]
+    param()
+
+    $sawLongCli = $false
+    foreach ($frame in Get-PSCallStack) {
+        $names = [Collections.Generic.List[string]]::new()
+        if (-not [string]::IsNullOrWhiteSpace([string] $frame.Command)) {
+            $names.Add([string] $frame.Command)
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string] $frame.ScriptName)) {
+            $names.Add([IO.Path]::GetFileNameWithoutExtension([string] $frame.ScriptName))
+        }
+        foreach ($name in $names) {
+            $leaf = [IO.Path]::GetFileNameWithoutExtension($name)
+            if ($leaf -eq 'ag-sync') {
+                return 'ag-sync'
+            }
+            if ($leaf -eq 'agent-guidance-sync') {
+                $sawLongCli = $true
+            }
+        }
+    }
+    if ($sawLongCli) {
+        return 'agent-guidance-sync'
+    }
+    if (Get-Command -Name ag-sync -ErrorAction SilentlyContinue) {
+        return 'ag-sync'
+    }
+    if (Get-Command -Name agent-guidance-sync -ErrorAction SilentlyContinue) {
+        return 'agent-guidance-sync'
+    }
+
+    'Sync-AgentGuidance'
+}
+
+function ConvertTo-AgentGuidanceProfilePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [string] $ProfileRoot
+    )
+
+    if ($Path -eq '~') {
+        return [IO.Path]::GetFullPath($ProfileRoot)
+    }
+    if ($Path.StartsWith('~/') -or $Path.StartsWith('~\')) {
+        $relativeToProfile = $Path.Substring(2).Replace('/', [IO.Path]::DirectorySeparatorChar)
+        return [IO.Path]::GetFullPath((Join-Path $ProfileRoot $relativeToProfile))
+    }
+    if ([IO.Path]::IsPathRooted($Path)) {
+        return [IO.Path]::GetFullPath($Path)
+    }
+
+    [IO.Path]::GetFullPath((Join-Path $ProfileRoot $Path))
+}
+
+function Get-AgentGuidanceSshConfigAliases {
+    [CmdletBinding()]
+    param(
+        [string] $SshConfigPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SshConfigPath)) {
+        $profileRoot = [Environment]::GetFolderPath('UserProfile')
+        if ([string]::IsNullOrWhiteSpace($profileRoot)) {
+            return @()
+        }
+        $SshConfigPath = Join-Path $profileRoot '.ssh/config'
+    }
+    if (-not (Test-Path -LiteralPath $SshConfigPath -PathType Leaf)) {
+        return @()
+    }
+
+    $aliases = [Collections.Generic.List[string]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rawLine in [IO.File]::ReadAllLines($SshConfigPath)) {
+        $line = $rawLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+            continue
+        }
+        if ($line -notmatch '^(?i)Host\s+(.+)$') {
+            continue
+        }
+        foreach ($token in @($Matches[1] -split '\s+' | Where-Object { $_ })) {
+            if ($token -match '[*?]' -or $token.StartsWith('!')) {
+                continue
+            }
+            if ($token -notmatch '^[A-Za-z0-9._-]+(?:@[A-Za-z0-9._-]+)?$') {
+                continue
+            }
+            if ($seen.Add($token)) {
+                $aliases.Add($token)
+            }
+        }
+    }
+
+    @($aliases)
+}
+
+function Select-AgentGuidanceStarterFiles {
+    [CmdletBinding()]
+    param(
+        [string] $ProfileRoot = ([Environment]::GetFolderPath('UserProfile'))
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ProfileRoot)) {
+        throw 'The local user profile path is empty.'
+    }
+
+    $present = @(
+        foreach ($entry in $script:AgentGuidanceKnownFiles) {
+            $localPath = ConvertTo-AgentGuidanceProfilePath -Path $entry.SourcePath -ProfileRoot $ProfileRoot
+            if (Test-Path -LiteralPath $localPath -PathType Leaf) {
+                [pscustomobject]@{
+                    Name = $entry.Name
+                    SourcePath = $entry.SourcePath
+                    DestinationPath = $entry.DestinationPath
+                    LocalPath = $localPath
+                    Present = $true
+                    Fallback = $false
+                }
+            }
+        }
+    )
+    if ($present.Count -gt 0) {
+        return $present
+    }
+
+    @(
+        foreach ($entry in $script:AgentGuidanceKnownFiles) {
+            if (-not $entry.Starter) {
+                continue
+            }
+            [pscustomobject]@{
+                Name = $entry.Name
+                SourcePath = $entry.SourcePath
+                DestinationPath = $entry.DestinationPath
+                LocalPath = (ConvertTo-AgentGuidanceProfilePath -Path $entry.SourcePath -ProfileRoot $ProfileRoot)
+                Present = $false
+                Fallback = $true
+            }
+        }
+    )
+}
+
+function Initialize-AgentGuidanceConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ConfigPath,
+
+        [string] $ProfileRoot = ([Environment]::GetFolderPath('UserProfile')),
+
+        [string] $SshConfigPath
+    )
+
+    $currentDirectory = (Get-Location).ProviderPath
+    $resolvedConfigPath = Resolve-AgentGuidanceSourcePath -Path $ConfigPath -BaseDirectory $currentDirectory
+    if (Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf) {
+        throw "A config already exists at $resolvedConfigPath. Edit that file, or pass a different -ConfigPath."
+    }
+
+    $sourceLabel = [Environment]::MachineName
+    if ([string]::IsNullOrWhiteSpace($sourceLabel) -or $sourceLabel -match '[\r\n|]') {
+        $sourceLabel = 'primary-workstation'
+    }
+
+    $selectedFiles = @(Select-AgentGuidanceStarterFiles -ProfileRoot $ProfileRoot)
+    $document = [ordered]@{
+        sourceLabel = $sourceLabel
+        targets = @('host-one', 'host-two')
+        files = @(
+            foreach ($entry in $selectedFiles) {
+                [ordered]@{
+                    name = $entry.Name
+                    sourcePath = $entry.SourcePath
+                    destinationPath = $entry.DestinationPath
+                }
+            }
+        )
+    }
+    $json = ($document | ConvertTo-Json -Depth 5) + [Environment]::NewLine
+
+    $configDirectory = [IO.Path]::GetDirectoryName($resolvedConfigPath)
+    if (-not [string]::IsNullOrWhiteSpace($configDirectory)) {
+        New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+    }
+    [IO.File]::WriteAllText($resolvedConfigPath, $json, [Text.UTF8Encoding]::new($false))
+
+    $commandName = Get-AgentGuidanceOperatorCommand
+    $usedFallback = @($selectedFiles | Where-Object { $_.Fallback }).Count -gt 0
+    Write-Host "Wrote starter config: $resolvedConfigPath" -ForegroundColor Green
+    Write-Host "Source label: $sourceLabel"
+    if ($usedFallback) {
+        Write-Host 'No usual guidance files were found, so the Codex + Claude starter was written.' -ForegroundColor Yellow
+        Write-Host 'Preview will fail until those files exist or you edit the mappings.'
+    }
+    else {
+        Write-Host "Included $($selectedFiles.Count) local guidance file(s):"
+        foreach ($entry in $selectedFiles) {
+            Write-Host "  $($entry.Name)"
+            Write-Host "    $($entry.SourcePath) -> $($entry.DestinationPath)"
+        }
+    }
+
+    $sshAliases = @(
+        if ($PSBoundParameters.ContainsKey('SshConfigPath')) {
+            Get-AgentGuidanceSshConfigAliases -SshConfigPath $SshConfigPath
+        }
+        else {
+            Get-AgentGuidanceSshConfigAliases
+        }
+    )
+    if ($sshAliases.Count -gt 0) {
+        Write-Host "SSH aliases in ~/.ssh/config: $($sshAliases -join ', ')"
+    }
+
+    Write-Host ''
+    Write-Host "Next: replace host-one and host-two with your SSH aliases, then run $commandName"
+    Write-Host "Apply later with $commandName -apply"
+
+    [pscustomobject]@{
+        ConfigPath = $resolvedConfigPath
+        SourceLabel = $sourceLabel
+        Files = $selectedFiles
+        UsedFallback = $usedFallback
+        SshAliases = $sshAliases
+    }
+}
+
+function Get-AgentGuidancePreviewSummary {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [pscustomobject[]] $Inventory = @()
+    )
+
+    $reachable = @($Inventory | Where-Object { $_.Availability -eq 'Reachable' })
+    $skipped = @($Inventory | Where-Object { $_.Availability -eq 'Unavailable' })
+    $current = 0
+    $different = 0
+    $missing = 0
+    foreach ($target in $reachable) {
+        foreach ($item in @($target.Files)) {
+            switch ($item.Status) {
+                'Current' { $current++ }
+                'Missing' { $missing++ }
+                default { $different++ }
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        ReachableCount = $reachable.Count
+        SkippedCount = $skipped.Count
+        SkippedNames = @($skipped.ComputerName)
+        CurrentCount = $current
+        DifferentCount = $different
+        MissingCount = $missing
+        ChangeCount = $different + $missing
+        ComparedCount = $current + $different + $missing
+    }
+}
+
+function ConvertTo-AgentGuidanceCountPhrase {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [int] $Count,
+
+        [Parameter(Mandatory)]
+        [string] $Singular,
+
+        [Parameter(Mandatory)]
+        [string] $Plural
+    )
+
+    if ($Count -eq 1) {
+        return "1 $Singular"
+    }
+
+    "$Count $Plural"
+}
+
+function Resolve-AgentGuidanceRunScope {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Config,
+
+        [switch] $Settings
+    )
+
+    $commandName = Get-AgentGuidanceOperatorCommand
+    $fileCount = @($Config.Files).Count
+    if ($Settings) {
+        if ($null -eq $Config.CodexConfig) {
+            throw "No settings projection is configured. Add a codexConfig block to $($Config.ConfigPath), then rerun $commandName -settings."
+        }
+        return [pscustomobject]@{
+            IncludeFiles = $false
+            IncludeSettings = $true
+        }
+    }
+
+    if ($fileCount -eq 0) {
+        throw "This config only defines settings. Preview or apply them with $commandName -settings."
+    }
+
+    [pscustomobject]@{
+        IncludeFiles = $true
+        IncludeSettings = $false
+    }
+}
+
+function Write-AgentGuidancePreviewSummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Summary,
+
+        [Parameter(Mandatory)]
+        [string] $CommandName,
+
+        [switch] $Apply,
+
+        [switch] $Settings
+    )
+
+    $reachablePhrase = ConvertTo-AgentGuidanceCountPhrase -Count $Summary.ReachableCount -Singular 'reachable host' -Plural 'reachable hosts'
+    $parts = [Collections.Generic.List[string]]::new()
+    if ($Summary.CurrentCount -gt 0) {
+        $parts.Add((ConvertTo-AgentGuidanceCountPhrase -Count $Summary.CurrentCount -Singular 'already matches' -Plural 'already match'))
+    }
+    if ($Summary.DifferentCount -gt 0) {
+        $parts.Add((ConvertTo-AgentGuidanceCountPhrase -Count $Summary.DifferentCount -Singular 'will update' -Plural 'will update'))
+    }
+    if ($Summary.MissingCount -gt 0) {
+        $parts.Add((ConvertTo-AgentGuidanceCountPhrase -Count $Summary.MissingCount -Singular 'will create' -Plural 'will create'))
+    }
+
+    $summaryLine = "Summary: $reachablePhrase"
+    if ($Summary.SkippedCount -gt 0) {
+        $skippedPhrase = ConvertTo-AgentGuidanceCountPhrase -Count $Summary.SkippedCount -Singular 'skipped' -Plural 'skipped'
+        $summaryLine += ", $skippedPhrase ($($Summary.SkippedNames -join ', '))"
+    }
+    if ($parts.Count -gt 0) {
+        $summaryLine += ". $($parts -join ', ')."
+    }
+    else {
+        $summaryLine += '. No files were compared.'
+    }
+
+    Write-Host ''
+    Write-Host $summaryLine -ForegroundColor Cyan
+
+    if ($Apply) {
+        return
+    }
+
+    if ($Summary.ChangeCount -eq 0) {
+        Write-Host "Preview complete. Reachable hosts already match this source. No files would change." -ForegroundColor Cyan
+    }
+    else {
+        $applyHint = if ($Settings) { "$CommandName -settings -apply" } else { "$CommandName -apply" }
+        Write-Host "Preview complete. No files were changed. Run $applyHint to write this source state." -ForegroundColor Cyan
+    }
 }
 
 function Resolve-AgentGuidanceSourcePath {
@@ -392,7 +803,8 @@ function Import-AgentGuidanceConfig {
     $currentDirectory = (Get-Location).ProviderPath
     $resolvedConfigPath = Resolve-AgentGuidanceSourcePath -Path $ConfigPath -BaseDirectory $currentDirectory
     if (-not (Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf)) {
-        throw "Agent guidance config is missing: $resolvedConfigPath. Copy config.example.json there and edit it for this machine."
+        $commandName = Get-AgentGuidanceOperatorCommand
+        throw "No config file at $resolvedConfigPath. Create a starter with $commandName -init, or pass -ConfigPath."
     }
 
     try {
@@ -1405,12 +1817,12 @@ function Show-AgentGuidancePreview {
         foreach ($item in $target.Files) {
             $kind = if ($item.PSObject.Properties['Kind']) { [string] $item.Kind } else { 'ExactFile' }
             if ($item.Status -eq 'Current') {
-                Write-Host "  $($item.Name): current" -ForegroundColor Green
+                Write-Host "  $($item.Name): already matches" -ForegroundColor Green
                 continue
             }
 
             if ($kind -eq 'CodexConfig') {
-                $state = if ($item.Status -eq 'Missing') { 'missing; it will be created' } else { 'settings differ' }
+                $state = if ($item.Status -eq 'Missing') { 'will create' } else { 'settings will change' }
                 Write-Host "  $($item.Name): $state" -ForegroundColor Magenta
                 foreach ($change in $item.Changes) {
                     if ($change.Action -eq 'Remove') {
@@ -1424,11 +1836,11 @@ function Show-AgentGuidancePreview {
             }
 
             if ($item.Status -eq 'Missing') {
-                Write-Host "  $($item.Name): missing; it will be created" -ForegroundColor Magenta
+                Write-Host "  $($item.Name): will create" -ForegroundColor Magenta
                 continue
             }
 
-            Write-Host "  $($item.Name): different" -ForegroundColor Magenta
+            Write-Host "  $($item.Name): will update" -ForegroundColor Magenta
             if ($target.Platform -eq 'Windows') {
                 $remoteText = Get-AgentGuidanceWindowsContent `
                     -ComputerName $target.ComputerName `
@@ -1669,42 +2081,68 @@ function Sync-AgentGuidance {
     .DESCRIPTION
     Reads source files, an optional allowlisted Codex config projection, target
     SSH aliases, and home-relative destination paths from a JSON config. Without
-    -Apply, shows differences and makes no changes. With -Apply, stages every
-    target-specific payload first, fences against concurrent remote edits,
+    -apply, shows differences and makes no changes. Default preview and -apply
+    write instruction files only. -settings previews or applies the configured
+    Codex settings projection and does not copy instruction files. With -apply,
+    stages every selected payload first, fences against concurrent remote edits,
     creates timestamped backups, replaces each file atomically, and verifies
     SHA-256 readback. Targets with a hard SSH reachability failure during the
     initial probe are reported and skipped. Authentication, host-key, preflight,
-    staging, commit, and verification failures still stop the run.
+    staging, commit, and verification failures still stop the run. -init writes
+    a local starter config and does not connect to any host.
 
     .EXAMPLE
-    Sync-AgentGuidance
+    ag-sync -init
 
     .EXAMPLE
-    Sync-AgentGuidance -Apply
+    ag-sync
 
     .EXAMPLE
-    Sync-AgentGuidance -ComputerName host-one -Apply
+    ag-sync -apply
 
     .EXAMPLE
-    Sync-AgentGuidance -ConfigPath ./lab-config.json
+    ag-sync -settings
+
+    .EXAMPLE
+    ag-sync -settings -apply
+
+    .EXAMPLE
+    ag-sync -ComputerName host-one -apply
     #>
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'Sync')]
+    [Alias('ag-sync')]
     param(
+        [Parameter(ParameterSetName = 'Sync')]
         [ValidatePattern('^[A-Za-z0-9._-]+(?:@[A-Za-z0-9._-]+)?$')]
         [string[]] $ComputerName,
 
+        [Parameter(ParameterSetName = 'Sync')]
+        [Parameter(ParameterSetName = 'Init')]
         [string] $ConfigPath = (Get-AgentGuidanceDefaultConfigPath),
 
-        [switch] $Apply
+        [Parameter(ParameterSetName = 'Sync')]
+        [switch] $Apply,
+
+        [Parameter(ParameterSetName = 'Sync')]
+        [switch] $Settings,
+
+        [Parameter(Mandatory, ParameterSetName = 'Init')]
+        [switch] $Init
     )
 
-    foreach ($commandName in @('ssh', 'scp', 'git')) {
-        if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
-            throw "$commandName is required but is not available on PATH."
+    if ($Init) {
+        $null = Initialize-AgentGuidanceConfig -ConfigPath $ConfigPath
+        return
+    }
+
+    foreach ($toolName in @('ssh', 'scp', 'git')) {
+        if (-not (Get-Command $toolName -ErrorAction SilentlyContinue)) {
+            throw "$toolName is required but is not on PATH. Install OpenSSH and Git, then open a new terminal."
         }
     }
 
     $config = Import-AgentGuidanceConfig -ConfigPath $ConfigPath
+    $scope = Resolve-AgentGuidanceRunScope -Config $config -Settings:$Settings
     $targets = @(
         Resolve-AgentGuidanceTargets `
             -ConfiguredTarget $config.Targets `
@@ -1712,18 +2150,22 @@ function Sync-AgentGuidance {
             -UseOverride:$PSBoundParameters.ContainsKey('ComputerName')
     )
 
-    $files = @($config.Files)
+    $files = @(
+        if ($scope.IncludeFiles) {
+            $config.Files
+        }
+    )
 
     foreach ($item in $files) {
         if (-not (Test-Path -LiteralPath $item.LocalPath -PathType Leaf)) {
-            throw "Required source file is missing: $($item.LocalPath)"
+            throw "Required source file for '$($item.Name)' is missing: $($item.LocalPath). Create the file or remove that mapping from $($config.ConfigPath)."
         }
         $item | Add-Member -NotePropertyName LocalHash -NotePropertyValue ((Get-FileHash -LiteralPath $item.LocalPath -Algorithm SHA256).Hash.ToLowerInvariant())
     }
 
     $inventory = @()
     try {
-        $sourceSnapshot = if ($null -ne $config.CodexConfig) {
+        $sourceSnapshot = if ($scope.IncludeSettings) {
             Get-AgentGuidanceCodexSourceSnapshot -ConfigPath $config.CodexConfig.LocalPath
         }
         else {
@@ -1731,16 +2173,19 @@ function Sync-AgentGuidance {
         }
         Write-Host "Agent guidance source: $($config.SourceLabel)" -ForegroundColor Cyan
         Write-Host "Config: $($config.ConfigPath)" -ForegroundColor DarkGray
+        Write-Host $(if ($scope.IncludeSettings) { 'Mode: Codex settings projection' } else { 'Mode: instruction files' }) -ForegroundColor DarkGray
         $inventory = @(Get-AgentGuidanceInventory -ComputerName $targets -File $files)
         $reachableInventory = @($inventory | Where-Object { $_.Availability -eq 'Reachable' })
         $skippedInventory = @($inventory | Where-Object { $_.Availability -eq 'Unavailable' })
-        if ($null -ne $config.CodexConfig) {
+        if ($scope.IncludeSettings) {
             $inventory = @(Add-AgentGuidanceCodexConfigInventory `
                 -Inventory $inventory `
                 -CodexConfig $config.CodexConfig `
                 -SourceSnapshot $sourceSnapshot)
         }
         Show-AgentGuidancePreview -Inventory $inventory -SourceLabel $config.SourceLabel
+        $previewSummary = Get-AgentGuidancePreviewSummary -Inventory $inventory
+        $operatorCommand = Get-AgentGuidanceOperatorCommand
 
         if ($reachableInventory.Count -eq 0) {
             $unavailableNames = @($skippedInventory.ComputerName) -join ', '
@@ -1748,12 +2193,7 @@ function Sync-AgentGuidance {
         }
 
         if (-not $Apply) {
-            Write-Host ''
-            $previewMessage = "Preview complete for $($reachableInventory.Count) reachable target(s). No files were changed."
-            if ($skippedInventory.Count -gt 0) {
-                $previewMessage += " Skipped unavailable targets: $(@($skippedInventory.ComputerName) -join ', ')."
-            }
-            Write-Host "$previewMessage Run Sync-AgentGuidance -Apply to apply this exact source state." -ForegroundColor Cyan
+            Write-AgentGuidancePreviewSummary -Summary $previewSummary -CommandName $operatorCommand -Settings:$Settings
             return
         }
 
@@ -1908,4 +2348,5 @@ function Sync-AgentGuidance {
     }
 }
 
-Export-ModuleMember -Function Sync-AgentGuidance
+Set-Alias -Name ag-sync -Value Sync-AgentGuidance
+Export-ModuleMember -Function Sync-AgentGuidance -Alias ag-sync

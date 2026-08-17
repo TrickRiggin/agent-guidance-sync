@@ -90,4 +90,5 @@ Write-Host "Mode: $(if ($DevelopmentLink) { 'development link' } else { 'copy' }
 if ($null -ne $backupPath) {
     Write-Host "Previous installation preserved at $backupPath" -ForegroundColor Yellow
 }
-Write-Host "Command: $($command.Name)"
+Write-Host "Command: $($command.Name)  (alias: ag-sync)"
+Write-Host "Create a starter config: ag-sync -init"

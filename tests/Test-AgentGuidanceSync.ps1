@@ -195,11 +195,27 @@ try {
     Test-Case 'manifest and public command surface are valid' {
         Assert-Equal -Expected 'AgentGuidanceSync' -Actual $manifest.Name -Because 'manifest name should match the module folder'
         Assert-True -Condition ($manifest.Version.ToString() -match '^\d+\.\d+\.\d+$') -Because 'the module should use a three-part release version'
-        $exportedCommands = @((Get-Command -Module AgentGuidanceSync).Name | Sort-Object -Unique)
-        Assert-Equal -Expected 1 -Actual $exportedCommands.Count -Because 'only one command should be public'
-        Assert-Equal -Expected 'Sync-AgentGuidance' -Actual $exportedCommands[0] -Because 'the sync command should be exported'
-        $applyParameter = (Get-Command Sync-AgentGuidance).Parameters['Apply']
+        $exportedCommands = @(Get-Command -Module AgentGuidanceSync)
+        $exportedFunctions = @($exportedCommands | Where-Object { $_.CommandType -eq 'Function' } | ForEach-Object { $_.Name } | Sort-Object -Unique)
+        $exportedAliases = @((Get-Module AgentGuidanceSync).ExportedAliases.Keys | Sort-Object)
+        Assert-Equal -Expected 1 -Actual $exportedFunctions.Count -Because 'only one command should be public'
+        Assert-Equal -Expected 'Sync-AgentGuidance' -Actual $exportedFunctions[0] -Because 'the sync command should be exported'
+        Assert-Equal -Expected 1 -Actual $exportedAliases.Count -Because 'the short daily name should be an alias, not a second command'
+        Assert-Equal -Expected 'ag-sync' -Actual $exportedAliases[0] -Because 'ag-sync should be the exported alias'
+        Assert-Equal -Expected 'Sync-AgentGuidance' -Actual (Get-Command -Name ag-sync).ReferencedCommand.Name -Because 'ag-sync must resolve to Sync-AgentGuidance'
+        $applyParameter = (Get-Command Sync-AgentGuidance).Parameters['apply']
+        Assert-Equal -Expected 'Apply' -Actual $applyParameter.Name -Because 'PowerShell parameter names are case-insensitive; -apply is -Apply'
         Assert-Equal -Expected ([switch].FullName) -Actual $applyParameter.ParameterType.FullName -Because 'remote writes should require an explicit switch'
+        $initParameter = (Get-Command Sync-AgentGuidance).Parameters['init']
+        Assert-Equal -Expected 'Init' -Actual $initParameter.Name -Because '-init is the same switch as -Init'
+        Assert-Equal -Expected ([switch].FullName) -Actual $initParameter.ParameterType.FullName -Because 'starter generation should be an explicit switch on the same command'
+        $initIsOwnSet = @($initParameter.Attributes | Where-Object { $_ -is [Parameter] -and $_.ParameterSetName -eq 'Init' -and $_.Mandatory }).Count -ge 1
+        Assert-True -Condition $initIsOwnSet -Because 'Init should be its own parameter set'
+        $settingsParameter = (Get-Command Sync-AgentGuidance).Parameters['settings']
+        Assert-Equal -Expected 'Settings' -Actual $settingsParameter.Name -Because '-settings is the same switch as -Settings'
+        Assert-Equal -Expected ([switch].FullName) -Actual $settingsParameter.ParameterType.FullName -Because 'settings projection should require an explicit switch'
+        $operatorCommand = & $module { Get-AgentGuidanceOperatorCommand }
+        Assert-Equal -Expected 'ag-sync' -Actual $operatorCommand -Because 'operator hints should prefer the short daily name once the alias exists'
     }
 
     Test-Case 'npm package metadata matches the PowerShell module' {
@@ -210,8 +226,13 @@ try {
         Assert-Equal -Expected 'public' -Actual $package.publishConfig.access -Because 'the unscoped package should be explicitly public'
 
         $cliRelativePath = $package.bin.'agent-guidance-sync'
-        Assert-Equal -Expected 'bin/agent-guidance-sync.ps1' -Actual $cliRelativePath -Because 'npm should expose one stable command'
-        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $repositoryRoot $cliRelativePath) -PathType Leaf) -Because 'the npm command target should exist'
+        Assert-Equal -Expected 'bin/agent-guidance-sync.ps1' -Actual $cliRelativePath -Because 'the long npm name should keep working'
+        Assert-Equal -Expected $cliRelativePath -Actual $package.bin.'ag-sync' -Because 'ag-sync should be the same CLI, not a second implementation'
+        $cliPath = Join-Path $repositoryRoot $cliRelativePath
+        Assert-True -Condition (Test-Path -LiteralPath $cliPath -PathType Leaf) -Because 'the npm command target should exist'
+        $cliText = Get-Content -LiteralPath $cliPath -Raw
+        Assert-True -Condition ($cliText -match '\[switch\]\s+\$Init') -Because 'the npm CLI should forward -Init'
+        Assert-True -Condition ($cliText -match '\[switch\]\s+\$Settings') -Because 'the npm CLI should forward -Settings'
     }
 
     Test-Case 'literal escaping and remote directory parsing are platform-safe' {
@@ -262,11 +283,12 @@ try {
 
         $multiHarnessPath = Join-Path $repositoryRoot 'config.multi-harness.example.json'
         $multiHarness = & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $multiHarnessPath
-        Assert-Equal -Expected 5 -Actual $multiHarness.Files.Count -Because 'the broader preset should cover five verified harnesses'
+        Assert-Equal -Expected 6 -Actual $multiHarness.Files.Count -Because 'the broader preset should cover six verified harnesses'
 
         $expectedDestinations = @(
             '.codex/AGENTS.md',
             '.claude/CLAUDE.md',
+            '.grok/AGENTS.md',
             '.pi/agent/AGENTS.md',
             '.omp/agent/AGENTS.md',
             '.config/opencode/AGENTS.md'
@@ -299,6 +321,192 @@ try {
         Assert-Equal -Expected 24 -Actual $portable.CodexConfig.PortableKeys.Count -Because 'the example should own only reviewed portable settings'
         Assert-Equal -Expected 1 -Actual $portable.CodexConfig.WindowsKeys.Count -Because 'Windows sandbox implementation should be platform-scoped'
         Assert-Equal -Expected 5 -Actual $portable.CodexConfig.RemoveKeys.Count -Because 'the example should remove only reviewed stale keys'
+
+        $catalogDestinations = @(& $module { @($script:AgentGuidanceKnownFiles | ForEach-Object { $_.DestinationPath }) })
+        Assert-Equal `
+            -Expected ($expectedDestinations -join '|') `
+            -Actual ($catalogDestinations -join '|') `
+            -Because 'the Init catalog should stay aligned with the verified multi-harness destinations'
+    }
+
+    Test-Case 'Init selects existing local files and falls back to the two-file starter' {
+        $profileRoot = Join-Path $temporaryRoot 'init-profile'
+        $claudePath = Join-Path $profileRoot '.claude/CLAUDE.md'
+        $grokPath = Join-Path $profileRoot '.grok/AGENTS.md'
+        $openCodePath = Join-Path $profileRoot '.config/opencode/AGENTS.md'
+        Set-TestText -Path $claudePath -Content 'claude guidance'
+        Set-TestText -Path $grokPath -Content 'grok guidance'
+        Set-TestText -Path $openCodePath -Content 'opencode guidance'
+
+        $selected = @(& $module { param($root) Select-AgentGuidanceStarterFiles -ProfileRoot $root } $profileRoot)
+        Assert-Equal -Expected 3 -Actual $selected.Count -Because 'only files that exist locally should be included'
+        Assert-Equal -Expected 'Claude CLAUDE.md' -Actual $selected[0].Name
+        Assert-Equal -Expected 'Grok AGENTS.md' -Actual $selected[1].Name
+        Assert-Equal -Expected 'OpenCode AGENTS.md' -Actual $selected[2].Name
+        Assert-True -Condition (-not $selected[0].Fallback) -Because 'detected files are not the fallback starter'
+
+        $emptyProfile = Join-Path $temporaryRoot 'init-empty-profile'
+        New-Item -ItemType Directory -Path $emptyProfile | Out-Null
+        $fallback = @(& $module { param($root) Select-AgentGuidanceStarterFiles -ProfileRoot $root } $emptyProfile)
+        Assert-Equal -Expected 2 -Actual $fallback.Count -Because 'the empty-profile starter should stay focused on Codex and Claude'
+        Assert-Equal -Expected 'Codex AGENTS.md' -Actual $fallback[0].Name
+        Assert-Equal -Expected 'Claude CLAUDE.md' -Actual $fallback[1].Name
+        Assert-True -Condition $fallback[0].Fallback -Because 'missing local files should use the documented starter pair'
+    }
+
+    Test-Case 'Init writes a starter config and refuses to overwrite it' {
+        $profileRoot = Join-Path $temporaryRoot 'init-write-profile'
+        Set-TestText -Path (Join-Path $profileRoot '.codex/AGENTS.md') -Content 'codex guidance'
+        $configPath = Join-Path $temporaryRoot 'init-write/config.json'
+        $sshConfigPath = Join-Path $temporaryRoot 'init-write/ssh-config'
+        Set-TestText -Path $sshConfigPath -Content @"
+Host lab-pi work-box
+    User demo
+Host *.example.com
+    User wildcard
+# Host commented-out
+Host github.com
+"@
+
+        $result = & $module {
+            param($path, $root, $sshPath)
+            Initialize-AgentGuidanceConfig -ConfigPath $path -ProfileRoot $root -SshConfigPath $sshPath
+        } $configPath $profileRoot $sshConfigPath
+
+        Assert-Equal -Expected ([IO.Path]::GetFullPath($configPath)) -Actual $result.ConfigPath
+        Assert-True -Condition (Test-Path -LiteralPath $configPath -PathType Leaf) -Because 'Init should write the starter file'
+        Assert-Equal -Expected 1 -Actual $result.Files.Count
+        Assert-Equal -Expected 'Codex AGENTS.md' -Actual $result.Files[0].Name
+        Assert-True -Condition (-not $result.UsedFallback)
+        Assert-Equal -Expected 'lab-pi|work-box|github.com' -Actual ($result.SshAliases -join '|') -Because 'SSH hints should include concrete Host aliases and skip wildcards'
+
+        $imported = & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $configPath
+        Assert-Equal -Expected 1 -Actual $imported.Files.Count
+        Assert-Equal -Expected '.codex/AGENTS.md' -Actual $imported.Files[0].RemoteRelativePath
+        Assert-Equal -Expected 2 -Actual $imported.Targets.Count
+        Assert-Equal -Expected 'host-one' -Actual $imported.Targets[0]
+
+        Assert-Throws -Pattern 'already exists' -Script {
+            & $module {
+                param($path, $root)
+                Initialize-AgentGuidanceConfig -ConfigPath $path -ProfileRoot $root
+            } $configPath $profileRoot
+        }
+    }
+
+    Test-Case 'missing config points at -Init instead of a nearby example file' {
+        $missingPath = Join-Path $temporaryRoot 'does-not-exist/config.json'
+        Assert-Throws -Pattern '(?i)-init' -Script {
+            & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $missingPath
+        }
+    }
+
+    Test-Case 'preview summary counts reachable, skipped, and change classes' {
+        $summary = & $module {
+            $inventory = @(
+                [pscustomobject]@{
+                    ComputerName = 'online-host'
+                    Availability = 'Reachable'
+                    Files = @(
+                        [pscustomobject]@{ Status = 'Current' }
+                        [pscustomobject]@{ Status = 'Different' }
+                        [pscustomobject]@{ Status = 'Missing' }
+                    )
+                }
+                [pscustomobject]@{
+                    ComputerName = 'offline-host'
+                    Availability = 'Unavailable'
+                    Files = @()
+                }
+            )
+            Get-AgentGuidancePreviewSummary -Inventory $inventory
+        }
+
+        Assert-Equal -Expected 1 -Actual $summary.ReachableCount
+        Assert-Equal -Expected 1 -Actual $summary.SkippedCount
+        Assert-Equal -Expected 'offline-host' -Actual $summary.SkippedNames[0]
+        Assert-Equal -Expected 1 -Actual $summary.CurrentCount
+        Assert-Equal -Expected 1 -Actual $summary.DifferentCount
+        Assert-Equal -Expected 1 -Actual $summary.MissingCount
+        Assert-Equal -Expected 2 -Actual $summary.ChangeCount
+    }
+
+    Test-Case 'Init cannot be combined with remote-write or target-override switches' {
+        $errorRecord = $null
+        try {
+            Sync-AgentGuidance -Init -Apply -ErrorAction Stop
+        }
+        catch {
+            $errorRecord = $_
+        }
+        Assert-True -Condition ($null -ne $errorRecord) -Because '-Init -Apply should fail before any work starts'
+        Assert-True -Condition ($errorRecord.Exception.Message -match 'Parameter set|parameter set') -Because 'PowerShell should reject the conflicting parameter set'
+
+        $settingsConflict = $null
+        try {
+            Sync-AgentGuidance -Init -Settings -ErrorAction Stop
+        }
+        catch {
+            $settingsConflict = $_
+        }
+        Assert-True -Condition ($null -ne $settingsConflict) -Because '-Init -Settings should fail before any work starts'
+        Assert-True -Condition ($settingsConflict.Exception.Message -match 'Parameter set|parameter set') -Because 'starter generation must not enter the settings path'
+    }
+
+    Test-Case 'default runs exclude settings and -settings excludes instruction files' {
+        $fileOnly = & $module {
+            Resolve-AgentGuidanceRunScope -Config ([pscustomobject]@{
+                ConfigPath = 'C:\temp\config.json'
+                Files = @([pscustomobject]@{ Name = 'AGENTS.md' })
+                CodexConfig = [pscustomobject]@{ Name = 'Codex config.toml settings' }
+            })
+        }
+        Assert-True -Condition $fileOnly.IncludeFiles -Because 'the default run should copy instruction files'
+        Assert-True -Condition (-not $fileOnly.IncludeSettings) -Because 'codexConfig must stay inert without -settings'
+
+        $settingsOnly = & $module {
+            Resolve-AgentGuidanceRunScope -Config ([pscustomobject]@{
+                ConfigPath = 'C:\temp\config.json'
+                Files = @([pscustomobject]@{ Name = 'AGENTS.md' })
+                CodexConfig = [pscustomobject]@{ Name = 'Codex config.toml settings' }
+            }) -Settings
+        }
+        Assert-True -Condition (-not $settingsOnly.IncludeFiles) -Because '-settings should not copy instruction files'
+        Assert-True -Condition $settingsOnly.IncludeSettings -Because '-settings should enable the Codex projection'
+
+        Assert-Throws -Pattern '(?i)-settings' -Script {
+            & $module {
+                Resolve-AgentGuidanceRunScope -Config ([pscustomobject]@{
+                    ConfigPath = 'C:\temp\config.json'
+                    Files = @([pscustomobject]@{ Name = 'AGENTS.md' })
+                    CodexConfig = $null
+                }) -Settings
+            }
+        }
+
+        Assert-Throws -Pattern '(?i)-settings' -Script {
+            & $module {
+                Resolve-AgentGuidanceRunScope -Config ([pscustomobject]@{
+                    ConfigPath = 'C:\temp\config.json'
+                    Files = @()
+                    CodexConfig = [pscustomobject]@{ Name = 'Codex config.toml settings' }
+                })
+            }
+        }
+    }
+
+    Test-Case 'Sync-AgentGuidance -Init writes through the public command' {
+        $configPath = Join-Path $temporaryRoot 'public-init/config.json'
+        Sync-AgentGuidance -Init -ConfigPath $configPath
+        Assert-True -Condition (Test-Path -LiteralPath $configPath -PathType Leaf) -Because 'the public command should write the starter'
+        $imported = & $module { param($path) Import-AgentGuidanceConfig -ConfigPath $path } $configPath
+        Assert-True -Condition ($imported.Files.Count -ge 1 -and $imported.Files.Count -le 6) -Because 'Init should write only known instruction mappings'
+        foreach ($file in $imported.Files) {
+            Assert-True -Condition ($file.RemoteRelativePath -match 'AGENTS\.md$|CLAUDE\.md$') -Because 'Init must not invent destinations outside the known catalog'
+        }
+        Assert-Throws -Pattern 'already exists' -Script {
+            Sync-AgentGuidance -Init -ConfigPath $configPath
+        }
     }
 
     Test-Case 'exact-copy mappings cannot bypass sensitive-state boundaries' {

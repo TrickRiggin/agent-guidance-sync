@@ -4,10 +4,26 @@ Safely preview and synchronize global agent instructions and a narrow set of por
 
 It started as a way to keep Codex `AGENTS.md` and Claude `CLAUDE.md` aligned across a small fleet without passing files through chat, email, or a cloud-drive folder. The same exact-file engine supports Pi, oh-my-pi, OpenCode, and other harnesses without merging or translating their distinct instructions. An optional semantic projection keeps selected Codex behavior consistent without copying machine-local trust, tools, plugins, or credentials.
 
+## Start here
+
+```powershell
+npm install --global agent-guidance-sync
+ag-sync -init
+```
+
+`-init` writes `~/.config/agent-guidance-sync/config.json`, includes any usual local guidance files it can see, and leaves `host-one` / `host-two` as placeholders. Replace those with SSH aliases from `~/.ssh/config`, then:
+
+```powershell
+ag-sync            # preview
+ag-sync -apply     # write
+```
+
+Preview is the default. `-apply` is the only way to change a remote file. Switches are case-insensitive, so `-Apply` still works. The long command `agent-guidance-sync` is the same program.
+
 ## Why this is safer than a copy loop
 
 - Preview-only by default, with readable diffs.
-- Remote writes require `-Apply`.
+- Remote writes require `-apply`.
 - Every payload is staged on every reachable target before any destination changes.
 - Each write is fenced by the remote SHA-256 observed during preview; a concurrent edit aborts that write.
 - Existing files receive timestamped backups.
@@ -58,7 +74,7 @@ Install the published CLI from npm:
 npm install --global agent-guidance-sync
 ```
 
-This installs the `agent-guidance-sync` command. PowerShell 7.2 or newer is still required at runtime; npm is the delivery mechanism, not a JavaScript rewrite.
+This installs `ag-sync` and the longer `agent-guidance-sync` name. PowerShell 7.2 or newer is still required at runtime; npm is the delivery mechanism, not a JavaScript rewrite. A module install from this repo exports the same `ag-sync` alias.
 
 To install directly from a repository clone instead, run:
 
@@ -76,20 +92,22 @@ The installer refuses to replace an existing `AgentGuidanceSync` installation un
 
 ## Configure
 
-Create the default private configuration directory and put your `config.json` there:
+The usual path is `ag-sync -init`. That creates the default private config directory and writes a starter `config.json` without overwriting an existing file.
+
+If you prefer to copy a preset by hand:
 
 ```powershell
 $configDirectory = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config/agent-guidance-sync'
 New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
 ```
 
-If you are working from a repository clone, [`config.example.json`](config.example.json) is a copy-ready starter:
+From a repository clone, [`config.example.json`](config.example.json) is a copy-ready starter:
 
 ```powershell
 Copy-Item ./config.example.json (Join-Path $configDirectory 'config.json')
 ```
 
-For an npm installation, create `config.json` using this same starter structure:
+For an npm installation, the starter has this shape:
 
 ```json
 {
@@ -113,7 +131,14 @@ Do not commit the private config, guidance files, SSH configuration, keys, or au
 
 ### Portable Codex settings
 
-Use [`config.codex-portable.example.json`](config.codex-portable.example.json) when one workstation should define fleet-wide Codex behavior. The projection is key-based, not a `config.toml` copy:
+Use [`config.codex-portable.example.json`](config.codex-portable.example.json) when one workstation should define fleet-wide Codex behavior. The projection is key-based, not a `config.toml` copy. Putting `codexConfig` in the JSON makes those settings available; it does not include them in a normal run.
+
+```powershell
+ag-sync -settings            # preview portable Codex settings
+ag-sync -settings -apply     # write only that projection
+```
+
+A default `ag-sync -apply` still writes instruction files only.
 
 ```json
 {
@@ -145,17 +170,18 @@ This keeps "same behavior" separate from "same machine." Raw file mappings are a
 
 ### Multi-harness configuration
 
-[`config.multi-harness.example.json`](config.multi-harness.example.json) contains verified native mappings for five harnesses:
+[`config.multi-harness.example.json`](config.multi-harness.example.json) contains verified native mappings for six harnesses:
 
 | Harness | Global instruction file | Important behavior |
 |---|---|---|
 | Codex | `~/.codex/AGENTS.md` | Codex-native global guidance. |
 | Claude Code | `~/.claude/CLAUDE.md` | Claude-native global guidance. |
+| Grok | `~/.grok/AGENTS.md` | Grok-native global rules. Applies to every project. |
 | Pi | `~/.pi/agent/AGENTS.md` | Pi's global context file. |
 | oh-my-pi | `~/.omp/agent/AGENTS.md` | Native OMP context; it has the highest OMP discovery priority. |
 | OpenCode | `~/.config/opencode/AGENTS.md` | Native OpenCode rules; these take precedence over its Claude compatibility fallback. |
 
-The Pi path and context behavior are documented in [Using Pi](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/usage.md#context-files). OMP documents its native path, provider precedence, and shadowing behavior in [Context files](https://github.com/can1357/oh-my-pi/blob/main/docs/context-files.md). OpenCode documents its global path and Claude fallback in [Rules](https://opencode.ai/docs/rules/).
+The Pi path and context behavior are documented in [Using Pi](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/usage.md#context-files). OMP documents its native path, provider precedence, and shadowing behavior in [Context files](https://github.com/can1357/oh-my-pi/blob/main/docs/context-files.md). OpenCode documents its global path and Claude fallback in [Rules](https://opencode.ai/docs/rules/). Grok documents global rules under `~/.grok/` in [AGENTS.md](https://docs.x.ai/build/features/project-rules); the named home file is `~/.grok/AGENTS.md`.
 
 Copy the broader preset instead of the two-file starter when you use those harnesses:
 
@@ -171,48 +197,45 @@ The preset intentionally excludes:
 - Settings, provider configuration, model catalogs, and session history.
 - Pi's `SYSTEM.md` and `APPEND_SYSTEM.md`, which alter the system prompt rather than serving as ordinary global guidance.
 - OMP's `RULES.md`, which is short, sticky, and precedence-sensitive. Add it as a separate explicit mapping only when you deliberately want identical sticky rules on every target.
+- Grok's `config.toml`, `auth.json`, sessions, and `~/.grok/rules/` directory. Those are machine-local settings, credentials, or a folder of files rather than one global instruction file.
 
 OMP can read several other harness conventions, but creating its native `~/.omp/agent/AGENTS.md` changes which user-level file wins. Keep that mapping only when you maintain genuinely OMP-specific guidance.
 
 ## Use
 
-Preview the entire configured fleet with the npm-installed CLI:
+If you do not have a config yet:
 
 ```powershell
-agent-guidance-sync
+ag-sync -init
+```
+
+Preview the entire configured fleet:
+
+```powershell
+ag-sync
 ```
 
 Apply exactly what was previewed:
 
 ```powershell
-agent-guidance-sync -Apply
+ag-sync -apply
 ```
 
 Limit a run to one or more targets:
 
 ```powershell
-agent-guidance-sync -ComputerName host-one
-agent-guidance-sync -ComputerName host-one,host-two -Apply
+ag-sync -ComputerName host-one
+ag-sync -ComputerName host-one,host-two -apply
 ```
 
-If you installed the module directly from a clone, use its PowerShell command instead:
+Portable Codex settings, if configured, are a separate run:
 
 ```powershell
-Sync-AgentGuidance
+ag-sync -settings
+ag-sync -settings -apply
 ```
 
-Apply exactly what was previewed:
-
-```powershell
-Sync-AgentGuidance -Apply
-```
-
-The same parameters are available:
-
-```powershell
-Sync-AgentGuidance -ComputerName host-one
-Sync-AgentGuidance -ComputerName host-one,host-two -Apply
-```
+`agent-guidance-sync` and `Sync-AgentGuidance` accept the same parameters. After a module-only install, `ag-sync` is the exported alias for `Sync-AgentGuidance`.
 
 Existing harness sessions may retain their startup instructions. Start a new session after syncing when you need the new guidance loaded immediately.
 
