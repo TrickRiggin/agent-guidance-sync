@@ -433,6 +433,35 @@ Host github.com
         Assert-Equal -Expected 2 -Actual $summary.ChangeCount
     }
 
+    Test-Case 'preview summary handles all reachable hosts without skipped names' {
+        $summary = & $module {
+            Get-AgentGuidancePreviewSummary -Inventory @(
+                [pscustomobject]@{
+                    ComputerName = 'online-host'
+                    Availability = 'Reachable'
+                    Files = @([pscustomobject]@{ Status = 'Different' })
+                }
+            )
+        }
+
+        Assert-Equal -Expected 1 -Actual $summary.ReachableCount
+        Assert-Equal -Expected 0 -Actual $summary.SkippedCount
+        Assert-True -Condition ($summary.SkippedNames -is [array]) -Because 'skipped names should remain an array when empty'
+        Assert-Equal -Expected 0 -Actual $summary.SkippedNames.Count
+        Assert-Equal -Expected 1 -Actual $summary.ChangeCount
+        Assert-Equal -Expected 1 -Actual $summary.ComparedCount
+    }
+
+    Test-Case 'preview summary handles an empty inventory' {
+        $summary = & $module { Get-AgentGuidancePreviewSummary -Inventory @() }
+
+        Assert-Equal -Expected 0 -Actual $summary.ReachableCount
+        Assert-Equal -Expected 0 -Actual $summary.SkippedCount
+        Assert-Equal -Expected 0 -Actual $summary.SkippedNames.Count
+        Assert-Equal -Expected 0 -Actual $summary.ChangeCount
+        Assert-Equal -Expected 0 -Actual $summary.ComparedCount
+    }
+
     Test-Case 'Init cannot be combined with remote-write or target-override switches' {
         $errorRecord = $null
         try {

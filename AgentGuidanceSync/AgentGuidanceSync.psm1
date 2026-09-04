@@ -1074,7 +1074,7 @@ function Get-AgentGuidancePreviewSummary {
     [pscustomobject]@{
         ReachableCount = $reachable.Count
         SkippedCount = $skipped.Count
-        SkippedNames = @($skipped.ComputerName)
+        SkippedNames = @($skipped | ForEach-Object { $_.ComputerName })
         CurrentCount = $current
         DifferentCount = $different
         MissingCount = $missing
